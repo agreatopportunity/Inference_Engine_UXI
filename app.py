@@ -153,11 +153,31 @@ CHAT_TEMPLATES = {
 
 def detect_template(model_path: str) -> str:
     """Auto-detect chat template from model filename"""
-    filename = model_path.lower()
-    for template_name, template_info in CHAT_TEMPLATES.items():
-        for pattern in template_info["detect"]:
+    filename = os.path.basename(model_path).lower()
+    
+    # Priority order: Check specific patterns first, generic patterns last
+    # This prevents "inst" from matching before "deepseek"
+    priority_order = [
+        "DeepSeek-V2/V3",    # Check deepseek-v2/v3/r1 first
+        "DeepSeek",          # Then regular deepseek
+        "Llama-3",           # Check llama-3 before generic llama
+        "Phi-3",             # Check phi-3 before generic patterns
+        "ChatML (Qwen/Yi)",  # Qwen, Yi
+        "Gemma",
+        "Command-R",
+        "Zephyr",
+        "Vicuna",
+        "Alpaca",
+        "Llama-2/Mistral",   # Generic inst/mistral patterns LAST
+    ]
+    
+    for template_name in priority_order:
+        if template_name not in CHAT_TEMPLATES:
+            continue
+        for pattern in CHAT_TEMPLATES[template_name]["detect"]:
             if pattern in filename:
                 return template_name
+    
     return "None (Raw)"
 
 def apply_template(prompt: str, template_name: str) -> str:
