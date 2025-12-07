@@ -36,7 +36,7 @@ CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python --upgrade --force-reins
 
 Ensure your project folder contains these files:
 
-  * **`sovra_omni.py`**: The main UI script ( `app.py`).
+  * **`app.py`**: The main UI script ( `app.py`).
   * **`model_llama3.py`**: The architecture file (Required so the script knows how to build the model).
   * **`checkpoints/latest.pt`**: Your trained model file.
 
