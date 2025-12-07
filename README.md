@@ -5,13 +5,12 @@ This interface is **Hardware Agnostic**, meaning it auto-detects your GPU (Titan
 
 ---
 
-## 📦 Step 1: Installation & Setup
+## Step 1: Installation & Setup
 ```markdown
 ### 1\. The Core Essentials (Run this first)
 
 This covers your custom LLaMA-3 model, the training scripts, and the new Holo-Glass UI.
 
-```bash
 # Core AI & Math libraries
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 pip install numpy
