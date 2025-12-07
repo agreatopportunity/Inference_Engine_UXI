@@ -1,9 +1,6 @@
-Here is the fully rewritten, professional **README\_INFERENCE.md**. It includes the correct installation commands (especially for GPU acceleration), file requirements, and usage scenarios.
-
-You can save this file as `README_INFERENCE.md` in your project folder.
 
 ````markdown
-# 🌌 SOVRA OMNI: Universal AI Interface
+# 🌌 Universal AI Interface
 
 **The "Holo-Glass" Cognitive Interface for your custom LLaMA-3 models.**
 This interface is **Hardware Agnostic**, meaning it auto-detects your GPU (Titan V vs. RTX 4090) and adjusts precision (`float16` vs `bfloat16`) and attention mechanisms automatically to prevent crashes and maximize speed.
