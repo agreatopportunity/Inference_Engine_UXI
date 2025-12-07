@@ -1,6 +1,6 @@
 """
 ╔═══════════════════════════════════════════════════════════════════════════════╗
-║  SOVRA OMNI v2.0 - Neural Interface for LLM Inference                         ║
+║  - Neural Interface for LLM Inference                                         ║
 ║  ─────────────────────────────────────────────────────────────────────────────║
 ║  Supports:                                                                    ║
 ║    • Native Models (.pt) - Custom LLaMA-3 architecture                        ║
@@ -32,7 +32,7 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] in ['-h', '--help']:
         print("""
 ╔═══════════════════════════════════════════════════════════════════════════════╗
-║  SOVRA OMNI v2.0 - Command Line Arguments                                     ║
+║  - Command Line Arguments                                                     ║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
 ║                                                                               ║
 ║  --device_id  : GPU Index to use (Default: 0)                                 ║
@@ -741,7 +741,7 @@ with gr.Blocks(css=CSS, theme=cyberpunk_theme, title="SOVRA OMNI") as demo:
 if __name__ == "__main__":
     print(f"""
 ╔═══════════════════════════════════════════════════════════════════════════════╗
-║  SOVRA OMNI v2.0 - Initializing...                                            ║
+║  - Initializing...                                                            ║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
 ║  Port:   {args.port:<6}                                                       ║
 ║  Share:  {str(args.share):<6}                                                 ║
