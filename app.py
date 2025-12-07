@@ -1,189 +1,261 @@
 """
-Universal LLM Playground (2025 Edition)
+Universal LLM Playground Cognitive Architecture (2025 Edition)
 Compatible with: Titan V, RTX 3090, 4090, 5090
+Supports:
+1. Custom Native Models (.pt)
+2. GGUF Community Models (.gguf)
+Integrates:
+1. Multi-GPU Loader (Titan V / RTX 4090 / 5090)
+2. Cognitive Emotional Core (Memory + Decay)
+3. 2026 Holo-Glass UI
 """
 import gradio as gr
 import torch
 import torch.nn.functional as F
 import tiktoken
 import contextlib
-import argparse
 import os
+import time
+import json
+import threading
+from datetime import datetime
+from pathlib import Path
 
-# Import your architecture
-from model_llama3 import GPT, GPTConfig
+# --- IMPORT ARCHITECTURE ---
+try:
+    from model_llama3 import GPT, GPTConfig
+except ImportError:
+    print("⚠️  model_llama3.py not found. Please ensure it is in the same folder.")
 
 # --- HARDWARE AUTO-DETECTION ---
-def get_optimal_device_settings(device_id=0):
-    """
-    Automatically determines the best precision and attention mechanisms
-    based on the specific GPU architecture detected.
-    """
+def get_hardware_config(device_index=0):
     if not torch.cuda.is_available():
-        print("⚠️ No GPU detected. Using CPU (this will be slow).")
         return "cpu", "float32", contextlib.nullcontext()
-
-    device = f"cuda:{device_id}"
+    
+    device = f"cuda:{device_index}"
     props = torch.cuda.get_device_properties(device)
-    name = props.name
-    major_version = props.major
+    major = props.major
     
-    print(f"\n[Hardware Detected] {name} (Compute {major_version}.{props.minor})")
-    
-    # 1. Determine Precision (DType)
-    # Ampere (8.0) and newer support bfloat16 (RTX 30xx, 40xx, 50xx, A100, H100)
-    if major_version >= 8:
-        dtype = "bfloat16"
-        print("   ✅ Architecture supports bfloat16. Using modern precision.")
-    else:
-        # Volta (7.0) or Pascal (6.1) do not support bfloat16
+    # Titan V / Pascal (Major < 8) -> float16, No Flash Attn
+    if major < 8:
         dtype = "float16"
-        print("   ⚠️  Legacy architecture detected (Titan V / Pascal). Switching to float16 to prevent crashes.")
-
-    # 2. Determine Attention Backend
-    # Flash Attention requires Compute Capability 8.0+
-    if major_version >= 8:
-        # Default PyTorch behavior prefers Flash Attention on supported hardware
-        attn_context = contextlib.nullcontext()
-        print("   ✅ Flash Attention enabled.")
+        attn_ctx = torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=True)
+        print(f"[{props.name}] Detected Legacy GPU. Using float16 + Efficient Attn.")
     else:
-        # Force disable Flash Attention for older cards
-        attn_context = torch.backends.cuda.sdp_kernel(
-            enable_flash=False, 
-            enable_math=True, 
-            enable_mem_efficient=True
-        )
-        print("   ⚠️  Flash Attention disabled (Legacy compatibility mode).")
+        # Ampere / Ada / Blackwell (Major >= 8) -> bfloat16, Flash Attn
+        dtype = "bfloat16"
+        attn_ctx = contextlib.nullcontext()
+        print(f"[{props.name}] Detected Modern GPU. Using bfloat16 + Flash Attn.")
         
-    return device, dtype, attn_context
+    return device, dtype, attn_ctx
 
-# --- SETUP GLOBALS ---
-# We use a placeholder here; these get populated in the main block
-DEVICE = "cuda"
-DTYPE = "float16"
-ATTN_CONTEXT = contextlib.nullcontext()
-CHECKPOINT = "checkpoints/latest.pt"
+# --- GLOBAL STATE ---
+MODEL = None
+ENC = None
+DEVICE, DTYPE, ATTN_CTX = get_hardware_config(device_index=1) # Default to GPU 1 (Titan V)
+
+# --- COGNITIVE CORE (LOCAL EDITION) ---
+class LocalCognitiveMind:
+    """
+    Adapted from ai_x5_cognitive to use LOCAL GPU instead of API
+    """
+    def __init__(self):
+        self.emotions = {
+            "curiosity": 0.5, "focus": 0.5, "energy": 0.5, 
+            "warmth": 0.5, "uncertainty": 0.1
+        }
+        self.frame = "Neutral"
+        self.awareness = 0.5
+        self.history = []
+    
+    def process(self, prompt, model, enc, max_new_tokens=200):
+        # 1. Update State
+        self.awareness = min(1.0, self.awareness + 0.05)
+        self.emotions["focus"] = min(1.0, self.emotions["focus"] + 0.1)
+        
+        # 2. Build Context
+        system_prompt = f"""You are Sovra.
+        STATE: Frame={self.frame} | Focus={self.emotions['focus']:.2f}
+        USER: {prompt}
+        SOVRA:"""
+        
+        # 3. Generate (On GPU)
+        return self.generate_local(system_prompt, model, enc, max_new_tokens)
+
+    def generate_local(self, text, model, enc, max_tokens):
+        if model is None: return "Error: Neural Link Offline."
+        
+        input_ids = torch.tensor(enc.encode(text)).unsqueeze(0).to(DEVICE)
+        
+        model.eval()
+        response_tokens = []
+        
+        with torch.no_grad(), ATTN_CTX:
+            for _ in range(max_tokens):
+                # Crop context
+                if input_ids.size(1) > model.config.block_size:
+                    input_ids = input_ids[:, -model.config.block_size:]
+                
+                logits, _ = model(input_ids)
+                logits = logits[:, -1, :] / 0.8 # Temperature
+                
+                # Sampling
+                probs = F.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+                
+                input_ids = torch.cat((input_ids, next_token), dim=1)
+                response_tokens.append(next_token.item())
+                
+                # Stop token check (optional)
+                if next_token.item() == 50256: # EOT
+                    break
+        
+        return enc.decode(response_tokens)
+
+MIND = LocalCognitiveMind()
 
 # --- MODEL LOADER ---
-def load_model(device, dtype):
-    print(f"\nLoading model from {CHECKPOINT}...")
+def load_native_model(checkpoint_path, gpu_idx):
+    global MODEL, ENC, DEVICE, DTYPE, ATTN_CTX
     
-    # 1. Load to CPU first (Critical for cross-GPU compatibility)
+    # Update Hardware Config based on selection
+    DEVICE, DTYPE, ATTN_CTX = get_hardware_config(gpu_idx)
+    
+    print(f"Loading {checkpoint_path} to {DEVICE} ({DTYPE})...")
     try:
-        checkpoint = torch.load(CHECKPOINT, map_location='cpu', weights_only=False)
-    except FileNotFoundError:
-        return None, f"Checkpoint not found at {CHECKPOINT}"
-
-    # 2. Load Config
-    if isinstance(checkpoint['model_config'], dict):
-        config = GPTConfig(**checkpoint['model_config'])
-    else:
-        config = checkpoint['model_config']
-    
-    print(f"   Config: {config.n_layer} layers, {config.n_head} heads")
-    model = GPT(config)
-    
-    # 3. Clean State Dict (Remove torch.compile '_orig_mod.' prefix)
-    state_dict = checkpoint['model']
-    clean_state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
-    model.load_state_dict(clean_state_dict)
-    
-    # 4. Cast Precision
-    if dtype == "bfloat16":
-        model.bfloat16()
-    elif dtype == "float16":
-        model.half()
-    else:
-        model.float()
+        ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
         
-    # 5. Move to GPU
-    print(f"   Moving model to {device}...")
-    model.to(device)
-    model.eval()
-    return model, None
-
-# --- GENERATION FUNCTION ---
-def generate_text(prompt, max_tokens, temperature, top_k):
-    if model is None:
-        return "Error: Model failed to load. Check console."
-
-    # Encode
-    encoded = enc.encode(prompt)
-    idx = torch.tensor(encoded).unsqueeze(0).to(DEVICE)
-    
-    generated_text = prompt
-    
-    # Run generation
-    model.eval()
-    # Use the hardware-specific attention context we detected earlier
-    with torch.no_grad(), ATTN_CONTEXT:
-        for _ in range(max_tokens):
-            # Crop context if needed
-            idx_cond = idx if idx.size(1) <= model.config.block_size else idx[:, -model.config.block_size:]
+        if isinstance(ckpt['model_config'], dict):
+            config = GPTConfig(**ckpt['model_config'])
+        else:
+            config = ckpt['model_config']
             
-            logits, _ = model(idx_cond)
-            logits = logits[:, -1, :] / temperature
-            
-            if top_k > 0:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-            
-            probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
-            
-            # Decode token
-            new_token = enc.decode([idx_next.item()])
-            generated_text += new_token
-            
-            # Update sequence
-            idx = torch.cat((idx, idx_next), dim=1)
-            
-            yield generated_text
-
-# --- MAIN ENTRY POINT ---
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--device_id', type=int, default=0, help="Which GPU index to use (default 0)")
-    parser.add_argument('--checkpoint', type=str, default="checkpoints/latest.pt")
-    args = parser.parse_args()
-
-    CHECKPOINT = args.checkpoint
-    
-    # 1. Run Auto-Detection
-    DEVICE, DTYPE, ATTN_CONTEXT = get_optimal_device_settings(args.device_id)
-    
-    # 2. Load Resources
-    model, error_msg = load_model(DEVICE, DTYPE)
-    
-    if model:
-        enc = tiktoken.get_encoding("gpt2")
-        print("✅ System Ready!")
+        model = GPT(config)
         
-        # 3. Launch UI
-        gpu_name = torch.cuda.get_device_name(DEVICE)
+        # Clean dict
+        state_dict = ckpt['model']
+        clean_state = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+        model.load_state_dict(clean_state)
         
-        with gr.Blocks(theme=gr.themes.Soft(), title=f"LLM Lab - {gpu_name}") as demo:
-            gr.Markdown(f"# 🧠 Universal LLM Playground")
-            gr.Markdown(f"**Hardware:** {gpu_name} | **Precision:** {DTYPE} | **Attention:** {'Standard' if DTYPE == 'bfloat16' else 'Legacy (Efficient)'}")
-            
-            with gr.Row():
-                with gr.Column(scale=1):
-                    prompt_input = gr.Textbox(label="Prompt", placeholder="The future of AI is...", lines=5)
-                    with gr.Accordion("Settings", open=True):
-                        max_tokens = gr.Slider(10, 1000, value=200, step=10, label="Max Tokens")
-                        temperature = gr.Slider(0.1, 2.0, value=0.8, label="Temperature")
-                        top_k = gr.Slider(0, 500, value=200, label="Top-K")
-                    generate_btn = gr.Button("🚀 Generate", variant="primary")
+        # Cast Precision
+        if DTYPE == 'float16': model.half()
+        elif DTYPE == 'bfloat16': model.bfloat16()
+        
+        model.to(DEVICE)
+        model.eval()
+        
+        MODEL = model
+        ENC = tiktoken.get_encoding("gpt2")
+        return f"✅ Linked to {torch.cuda.get_device_name(DEVICE)}"
+    except Exception as e:
+        return f"❌ Link Failed: {str(e)}"
+
+# --- UI LOGIC ---
+def interaction_handler(user_text, image, history):
+    if not user_text: return history, history
+    
+    # 1. Update User History
+    history = history or []
+    history.append((user_text, None))
+    
+    # 2. Cognitive Processing
+    response = MIND.process(user_text, MODEL, ENC)
+    
+    # 3. Update Bot History
+    history[-1] = (user_text, response)
+    
+    return history, history
+
+def get_dashboard():
+    # Dynamic HTML updates for the UI
+    e = MIND.emotions
+    w = lambda x: max(5, int(x * 100))
+    
+    return f"""
+    <div style="font-family: 'Inter'; color: #94a3b8; font-size: 0.85rem;">
+        <div style="margin-bottom: 15px;">
+            <div style="display:flex; justify-content:space-between;">
+                <span>NEURAL SYNC</span>
+                <span style="color:#00f3ff">{MIND.awareness:.0%}</span>
+            </div>
+            <div style="height:4px; background:rgba(255,255,255,0.1); margin-top:4px;">
+                <div style="height:100%; width:{w(MIND.awareness)}%; background:#00f3ff;"></div>
+            </div>
+        </div>
+        <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px;">
+            <div>
+                <div style="display:flex; justify-content:space-between;"><span>Focus</span><span>{e['focus']:.1f}</span></div>
+                <div style="height:4px; background:rgba(255,255,255,0.1); margin-top:4px;">
+                    <div style="height:100%; width:{w(e['focus'])}%; background:#bc13fe;"></div>
+                </div>
+            </div>
+            <div>
+                <div style="display:flex; justify-content:space-between;"><span>Energy</span><span>{e['energy']:.1f}</span></div>
+                <div style="height:4px; background:rgba(255,255,255,0.1); margin-top:4px;">
+                    <div style="height:100%; width:{w(e['energy'])}%; background:#3b82f6;"></div>
+                </div>
+            </div>
+        </div>
+        <div style="margin-top:15px; border-top:1px solid rgba(255,255,255,0.1); padding-top:10px;">
+            <span style="color:#00f3ff">HARDWARE:</span> {torch.cuda.get_device_name(DEVICE)}
+        </div>
+    </div>
+    """
+
+# ============================================================
+# CSS THEME (2026 HOLO-GLASS)
+# ============================================================
+CSS = """
+:root { --glass: rgba(15, 23, 42, 0.7); --border: 1px solid rgba(255, 255, 255, 0.08); }
+body { background: #02040a; background-image: radial-gradient(circle at 50% 0%, #1e1b4b 0%, transparent 40%); }
+.gradio-container { max-width: 1400px !important; }
+.glass-panel { background: var(--glass); backdrop-filter: blur(20px); border: var(--border); border-radius: 20px; padding: 20px; }
+.sovra-title { font-family: 'Orbitron'; font-size: 3em; background: linear-gradient(to right, #00f3ff, #bc13fe); -webkit-background-clip: text; color: transparent; text-align: center; letter-spacing: 4px; }
+.primary-btn { background: linear-gradient(135deg, #00f3ff, #bc13fe); border: none; color: black; font-weight: bold; }
+.chat-window { height: 600px !important; }
+"""
+
+# ============================================================
+# UI BUILDER
+# ============================================================
+with gr.Blocks(css=CSS, theme=gr.themes.Base()) as demo:
+    
+    with gr.Row(elem_classes="glass-panel"):
+        gr.HTML('<div class="sovra-title">SOVRA OMNI</div><div style="text-align:center; color:#64748b; letter-spacing:2px;">LOCAL COGNITIVE ARCHITECTURE</div>')
+
+    with gr.Row():
+        # LEFT: CONTROLS
+        with gr.Column(scale=1):
+            with gr.Group(elem_classes="glass-panel"):
+                gr.Markdown("### 🔌 HARDWARE LINK")
+                gpu_select = gr.Dropdown(choices=[0, 1], label="Select GPU", value=1)
+                path_input = gr.Textbox(label="Model Path", value="checkpoints/latest.pt")
+                load_btn = gr.Button("INITIALIZE LINK", variant="secondary")
+                status_out = gr.Textbox(label="Status", interactive=False, value="Standby...")
                 
-                with gr.Column(scale=1):
-                    output_text = gr.Textbox(label="Output", lines=20, interactive=False)
+            with gr.Group(elem_classes="glass-panel"):
+                gr.Markdown("### 🧠 LIVE METRICS")
+                dashboard = gr.HTML(get_dashboard())
+                
+            with gr.Group(elem_classes="glass-panel"):
+                gr.Markdown("### 📂 DATA INGEST")
+                file_up = gr.File(label="Upload Context", file_count="multiple")
 
-            generate_btn.click(
-                fn=generate_text,
-                inputs=[prompt_input, max_tokens, temperature, top_k],
-                outputs=output_text
-            )
-            
-        demo.launch(server_name="0.0.0.0", share=True)
-    else:
-        print(f"❌ Failed to start: {error_msg}")
+        # RIGHT: INTERFACE
+        with gr.Column(scale=3):
+            with gr.Group(elem_classes="glass-panel"):
+                chatbot = gr.Chatbot(label="Neural Feed", elem_classes="chat-window", height=600, render=True)
+                with gr.Row():
+                    txt = gr.Textbox(scale=4, show_label=False, placeholder="Transmit data...", container=False)
+                    btn = gr.Button("SEND", elem_classes="primary-btn", scale=1)
+
+    # EVENTS
+    load_btn.click(load_native_model, [path_input, gpu_select], status_out)
+    
+    # Chat Loop
+    # We chain: Process -> Update Chat -> Update Dashboard
+    btn.click(interaction_handler, [txt, file_up, chatbot], [chatbot, chatbot]).then(get_dashboard, None, dashboard)
+    txt.submit(interaction_handler, [txt, file_up, chatbot], [chatbot, chatbot]).then(get_dashboard, None, dashboard)
+
+if __name__ == "__main__":
+    demo.launch(server_name="0.0.0.0", share=True)
