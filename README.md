@@ -37,7 +37,7 @@ rm -rf ~/miniconda3/miniconda.sh
 source ~/.bashrc
 ```
 
-### Step 2: Verify Installation
+### Verify Installation
 
 Run this to make sure Conda is working. It should return a version number (e.g., `conda 24.x.x`).
 
@@ -45,7 +45,7 @@ Run this to make sure Conda is working. It should return a version number (e.g.,
 conda --version
 ```
 
-### Step 3: Run Your Planned Commands
+### Run Your Planned Commands
 
 ```bash
 # Create your environment
