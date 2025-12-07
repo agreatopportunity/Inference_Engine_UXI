@@ -1,5 +1,9 @@
-```
-# 🌌 Universal AI Interface
+Here is the fully rewritten, professional **README\_INFERENCE.md**. It includes the correct installation commands (especially for GPU acceleration), file requirements, and usage scenarios.
+
+You can save this file as `README_INFERENCE.md` in your project folder.
+
+````markdown
+# 🌌 SOVRA OMNI: Universal AI Interface
 
 **The "Holo-Glass" Cognitive Interface for your custom LLaMA-3 models.**
 This interface is **Hardware Agnostic**, meaning it auto-detects your GPU (Titan V vs. RTX 4090) and adjusts precision (`float16` vs `bfloat16`) and attention mechanisms automatically to prevent crashes and maximize speed.
@@ -11,13 +15,13 @@ This interface is **Hardware Agnostic**, meaning it auto-detects your GPU (Titan
 Before running the UI, you must install the interface libraries.
 
 ### 1. Activate your Environment
-```
+```bash
 conda activate myLLM
 ````
 
 ### 2\. Install Core Dependencies
 
-```
+```bash
 pip install gradio tiktoken
 ```
 
@@ -25,7 +29,7 @@ pip install gradio tiktoken
 
 *Note: This specific command is required to make GGUF models run on your GPU instead of the slow CPU.*
 
-```
+```bash
 CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python --upgrade --force-reinstall --no-cache-dir
 ```
 
@@ -49,7 +53,7 @@ You can run this script on **ANY** machine. It will automatically diagnose your 
 
 *Use this if you are running on your main machine's primary GPU.*
 
-```
+```bash
 python3 sovra_omni.py
 ```
 
@@ -63,7 +67,7 @@ python3 sovra_omni.py
 
 *Use this if you are training on GPU 0 and want to chat on GPU 1 (Titan V).*
 
-```
+```bash
 python3 sovra_omni.py --device_id 1
 ```
 
@@ -77,7 +81,7 @@ python3 sovra_omni.py --device_id 1
 
 *Use this if you move the Titan V to its own separate machine.*
 
-```
+```bash
 python3 sovra_omni.py
 ```
 
