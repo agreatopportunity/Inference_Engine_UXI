@@ -79,7 +79,7 @@ pip install wandb
 
 ### 2\. Speed Optimization (Highly Recommended)
 
-This makes your 5090/4090/3090 / Titan V run about 20% faster.
+This makes your 5090/4090/3090 / Titan V or OLDER GPU run about 20% faster.
 
 ```bash
 pip install flash-attn --no-build-isolation
@@ -142,7 +142,7 @@ python3 app.py
   * **Attention:** Enables Flash Attention 2.
   * **Hardware:** Defaults to GPU 0.
 
-### Scenario B: The "Titan V" Setup (Multi-GPU)
+### Scenario B: The "Titan V/OLDER GPU" Setup (Multi-GPU)
 
 *Use this if you are training on GPU 0 and want to chat on GPU 1 (Titan V).*
 
@@ -152,13 +152,13 @@ python3 app.py --device_id 1
 
 **Result:**
 
-  * **Precision:** Auto-switches to `float16` (Prevents Titan V crash).
-  * **Attention:** Disables Flash Attention (Prevents Titan V crash).
+  * **Precision:** Auto-switches to `float16` (Prevents OLDER GPU crash).
+  * **Attention:** Disables Flash Attention (Prevents OLDER GPU crash).
   * **Hardware:** Forces execution on GPU 1.
 
 ### Scenario C: Single Legacy GPU
 
-*Use this if you move the Titan V to its own separate machine.*
+*Use this if you move the Titan V or OLDER GPU  to its own separate machine.*
 
 ```bash
 python3 app.py
