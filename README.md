@@ -59,9 +59,8 @@ Video Explanation: [Miniconda Installation](https://www.google.com/search?q=http
 *This video visually demonstrates the Miniconda installation process on Linux if you prefer to watch the steps.*
 
 
-```markdown
 ### 1\. The Core Essentials (Run this first)
-
+```markdown
 This covers your custom LLaMA-3 model, the training scripts, and the new Holo-Glass UI.
 
 # Core AI & Math libraries
