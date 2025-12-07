@@ -128,6 +128,15 @@ CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python
 ```
 pip install idna httpx httpcore --upgrade --force-reinstall
 ```
+
+**Error: You need to force-install the missing helper library (six) and the library calling it (python-dateutil) directly into your current environment.**
+
+* **Fix:** Run this command:
+
+```
+pip install six python-dateutil --upgrade --force-reinstall
+```
+
 -----
 ## 📂 Step 2: Verify File Structure
 
