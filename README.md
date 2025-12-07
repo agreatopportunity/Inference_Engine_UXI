@@ -6,7 +6,7 @@ This interface is **Hardware Agnostic**, meaning it auto-detects your GPU (Titan
 ---
 
 
-## Installation & Setup
+## Step 1:Installation & Setup
 
 To use your machine properly, you should install **Miniconda**. It is the industry standard for deep learning on Linux because it is lightweight and avoids the bloat of the full Anaconda distribution.
 
