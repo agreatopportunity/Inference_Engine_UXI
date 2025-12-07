@@ -117,11 +117,6 @@ pip install flash-attn --no-build-isolation
 CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python
 ```
 
-### 1. Activate your Environment
-```bash
-conda activate myLLM
-```
-
 ## 📂 Step 2: Verify File Structure
 
 Ensure your project folder contains these files:
