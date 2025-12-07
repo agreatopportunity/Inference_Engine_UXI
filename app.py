@@ -1,34 +1,50 @@
 """
-Universal LLM Playground Cognitive Architecture (2025 Edition)
-Compatible with: Titan V, RTX 3090, 4090, 5090
-Supports:
-1. Custom Native Models (.pt)
-2. GGUF Community Models (.gguf)
-Integrates:
-1. Multi-GPU Loader (Titan V / RTX 4090 / 5090)
-2. Cognitive Emotional Core (Memory + Decay)
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║  - Neural Interface for LLM Inference                                         ║
+║  ─────────────────────────────────────────────────────────────────────────────║
+║  Supports:                                                                    ║
+║    • Native Models (.pt) - Custom LLaMA-3 architecture                        ║
+║    • GGUF Models (.gguf) - DeepSeek, Llama, Mistral, etc.                     ║
+║                                                                               ║
+║  Features:                                                                    ║
+║    • Real-time streaming generation                                           ║
+║    • GPU memory monitoring                                                    ║
+║    • Multi-GPU support                                                        ║
+║    • Automatic precision selection (FP16/BF16)                                ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
 """
 import gradio as gr
 import torch
+import torch.nn.functional as F  # FIX: This was missing!
 import tiktoken
 import contextlib
 import argparse
 import os
 import sys
+import time
+import threading
+from datetime import datetime
 
-# --- HELP MENU & ARGUMENTS ---
+# ═══════════════════════════════════════════════════════════════════════════════
+# COMMAND LINE ARGUMENTS
+# ═══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    # Check for help flag manually before parsing to ensure custom message prints
     if len(sys.argv) > 1 and sys.argv[1] in ['-h', '--help']:
         print("""
-LLM UI - Command Line Arguments
------------------------------------
---device_id : GPU Index to use (Default: 0).
-              Common Setup: 0 = Titan V, 1 = GTX 1080 (Check nvidia-smi if unsure)
---port      : Port to run the UI on (Default: 7860)
---share     : Create a public share link (Useful for mobile access)
-
-Example: python3 app.py --device_id 0 --share
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║ - Command Line Arguments                                                      ║
+╠═══════════════════════════════════════════════════════════════════════════════╣
+║                                                                               ║
+║  --device_id  : GPU Index to use (Default: 0)                                 ║
+║                 Use 'nvidia-smi' to check your GPU indices                    ║
+║                                                                               ║
+║  --port       : Port to run the UI on (Default: 7860)                         ║
+║                                                                               ║
+║  --share      : Create a public Gradio share link                             ║
+║                                                                               ║
+║  Example: python3 app.py --device_id 0 --port 7860 --share                    ║
+║                                                                               ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
         """)
         sys.exit(0)
 
@@ -40,212 +56,760 @@ Example: python3 app.py --device_id 0 --share
     ARGS_DEVICE = args.device_id
 else:
     ARGS_DEVICE = 0
+    args = type('obj', (object,), {'port': 7860, 'share': False})()
 
-# --- IMPORT ARCHITECTURE (Native) ---
+# ═══════════════════════════════════════════════════════════════════════════════
+# IMPORT MODEL ARCHITECTURES
+# ═══════════════════════════════════════════════════════════════════════════════
 try:
     from model_llama3 import GPT, GPTConfig
+    NATIVE_AVAILABLE = True
 except ImportError:
-    print("⚠️ model_llama3.py not found. Native models will fail.")
+    print("⚠️  model_llama3.py not found. Native models disabled.")
+    NATIVE_AVAILABLE = False
 
-# --- IMPORT GGUF ENGINE ---
 try:
     from llama_cpp import Llama
     GGUF_AVAILABLE = True
 except ImportError:
-    print("⚠️ llama-cpp-python not found. GGUF models will fail.")
+    print("⚠️  llama-cpp-python not installed. GGUF models disabled.")
     GGUF_AVAILABLE = False
 
-# --- HARDWARE CONFIG ---
+# ═══════════════════════════════════════════════════════════════════════════════
+# GLOBAL STATE
+# ═══════════════════════════════════════════════════════════════════════════════
+CURRENT_MODEL = None
+CURRENT_ENGINE = None  # "native" or "gguf"
+MODEL_INFO = {}
+ENC = None
+STOP_GENERATION = False
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HARDWARE DETECTION & CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════════
+def get_gpu_info():
+    """Get detailed GPU information"""
+    if not torch.cuda.is_available():
+        return [{"id": -1, "name": "CPU Only", "memory": 0, "compute": "N/A"}]
+    
+    gpus = []
+    for i in range(torch.cuda.device_count()):
+        props = torch.cuda.get_device_properties(i)
+        gpus.append({
+            "id": i,
+            "name": props.name,
+            "memory": props.total_memory / 1e9,
+            "compute": f"{props.major}.{props.minor}",
+            "is_modern": props.major >= 8
+        })
+    return gpus
+
+def get_gpu_stats(device_id=0):
+    """Get real-time GPU statistics"""
+    if not torch.cuda.is_available():
+        return "CPU Mode - No GPU Stats"
+    
+    try:
+        torch.cuda.synchronize()
+        allocated = torch.cuda.memory_allocated(device_id) / 1e9
+        reserved = torch.cuda.memory_reserved(device_id) / 1e9
+        total = torch.cuda.get_device_properties(device_id).total_memory / 1e9
+        
+        usage_pct = (allocated / total) * 100
+        bar_len = 20
+        filled = int(bar_len * usage_pct / 100)
+        bar = "█" * filled + "░" * (bar_len - filled)
+        
+        return f"VRAM: [{bar}] {allocated:.1f}/{total:.1f} GB ({usage_pct:.0f}%)"
+    except Exception as e:
+        return f"Stats Error: {e}"
+
 def get_device_config(device_id):
+    """Configure device with optimal settings"""
     if not torch.cuda.is_available():
         return "cpu", "float32", contextlib.nullcontext()
     
     device = f"cuda:{device_id}"
     try:
         props = torch.cuda.get_device_properties(device)
-        print(f"[{props.name}] Detected on Device {device_id}")
         
-        # Auto-downgrade for Titan V / Pascal (Compute < 8.0)
-        if props.major < 8:
+        # Auto-select precision based on GPU architecture
+        if props.major < 8:  # Pre-Ampere (Titan V, 1080, 2080, etc.)
             dtype = "float16"
-            # Force efficient attention (disable Flash)
-            attn = torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=True)
-            print(f"   ↳ Legacy GPU detected. Force-enabling float16 & Efficient Attention.")
-        else:
+            attn = torch.backends.cuda.sdp_kernel(
+                enable_flash=False, 
+                enable_math=True, 
+                enable_mem_efficient=True
+            )
+        else:  # Ampere+ (3090, 4060 Ti, 4090, etc.)
             dtype = "bfloat16"
             attn = contextlib.nullcontext()
-            print(f"   ↳ Modern GPU detected. Enabling bfloat16 & Flash Attention.")
             
         return device, dtype, attn
     except Exception as e:
-        print(f"❌ Error initializing GPU {device_id}: {e}")
+        print(f"❌ GPU {device_id} Error: {e}")
         return "cpu", "float32", contextlib.nullcontext()
 
-# --- GLOBAL STATE ---
-CURRENT_MODEL = None
-CURRENT_ENGINE = None # "native" or "gguf"
-ENC = None
-
-# --- LOADERS ---
+# ═══════════════════════════════════════════════════════════════════════════════
+# MODEL LOADERS
+# ═══════════════════════════════════════════════════════════════════════════════
 def load_native(path, device_idx):
-    global CURRENT_MODEL, ENC, CURRENT_ENGINE
+    """Load native PyTorch model (.pt)"""
+    global CURRENT_MODEL, ENC, CURRENT_ENGINE, MODEL_INFO
+    
+    if not NATIVE_AVAILABLE:
+        return "❌ Native engine unavailable (model_llama3.py not found)"
     
     device, dtype, _ = get_device_config(device_idx)
-    print(f"Loading Native: {path}...")
     
     try:
         ckpt = torch.load(path, map_location='cpu', weights_only=False)
+        
+        # Extract config
         if isinstance(ckpt['model_config'], dict):
             conf = GPTConfig(**ckpt['model_config'])
         else:
             conf = ckpt['model_config']
-            
+        
+        # Build model
         model = GPT(conf)
+        
         # Clean state dict (remove torch.compile prefix)
         state_dict = {k.replace('_orig_mod.', ''): v for k, v in ckpt['model'].items()}
         model.load_state_dict(state_dict)
         
-        # Cast Precision based on Hardware Doctor
-        if dtype == 'float16': model.half()
-        elif dtype == 'bfloat16': model.bfloat16()
+        # Apply precision
+        if dtype == 'float16':
+            model.half()
+        elif dtype == 'bfloat16':
+            model.bfloat16()
         
         model.to(device)
         model.eval()
         
+        # Calculate parameters
+        params = sum(p.numel() for p in model.parameters())
+        
         CURRENT_MODEL = model
         ENC = tiktoken.get_encoding("gpt2")
         CURRENT_ENGINE = "native"
-        return f"✅ Loaded Native Model on GPU {device_idx} ({dtype})"
+        MODEL_INFO = {
+            "name": os.path.basename(path),
+            "params": f"{params/1e6:.1f}M",
+            "layers": conf.n_layer,
+            "heads": conf.n_head,
+            "ctx": conf.block_size,
+            "dtype": dtype,
+            "device": device
+        }
+        
+        return f"""✅ NEURAL LINK ESTABLISHED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Model:      {MODEL_INFO['name']}
+Parameters: {MODEL_INFO['params']}
+Layers:     {MODEL_INFO['layers']}
+Heads:      {MODEL_INFO['heads']}
+Context:    {MODEL_INFO['ctx']}
+Precision:  {dtype.upper()}
+Device:     {device}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+        
     except Exception as e:
-        return f"❌ Native Load Failed: {str(e)}"
+        return f"❌ LOAD FAILED: {str(e)}"
 
 def load_gguf(path, device_idx, n_ctx):
-    global CURRENT_MODEL, CURRENT_ENGINE
+    """Load GGUF model via llama.cpp"""
+    global CURRENT_MODEL, CURRENT_ENGINE, MODEL_INFO
     
-    if not GGUF_AVAILABLE: return "❌ Error: llama-cpp-python not installed."
+    if not GGUF_AVAILABLE:
+        return "❌ GGUF engine unavailable (pip install llama-cpp-python)"
     
-    print(f"Loading GGUF: {path} on GPU {device_idx}...")
     try:
-        # n_gpu_layers=-1 attempts to offload ALL layers to GPU
         model = Llama(
             model_path=path,
             n_ctx=n_ctx,
-            n_gpu_layers=-1,
+            n_gpu_layers=-1,  # Offload all layers to GPU
             main_gpu=device_idx,
             verbose=False
         )
         
         CURRENT_MODEL = model
         CURRENT_ENGINE = "gguf"
-        return f"✅ Loaded GGUF Model on GPU {device_idx}"
+        MODEL_INFO = {
+            "name": os.path.basename(path),
+            "params": "Unknown",
+            "ctx": n_ctx,
+            "device": f"cuda:{device_idx}"
+        }
+        
+        return f"""✅ GGUF CORE INITIALIZED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Model:   {MODEL_INFO['name']}
+Context: {n_ctx}
+GPU:     {device_idx}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+        
     except Exception as e:
-        return f"❌ GGUF Load Failed: {str(e)}"
+        return f"❌ GGUF LOAD FAILED: {str(e)}"
 
-# --- GENERATOR ---
-def generate(prompt, max_tokens, temp, top_k, device_idx):
+# ═══════════════════════════════════════════════════════════════════════════════
+# GENERATION ENGINE
+# ═══════════════════════════════════════════════════════════════════════════════
+def stop_generation():
+    """Signal to stop generation"""
+    global STOP_GENERATION
+    STOP_GENERATION = True
+    return "⏹️ Stop signal sent..."
+
+def generate(prompt, max_tokens, temperature, top_k, top_p, device_idx):
+    """Stream tokens from loaded model"""
+    global STOP_GENERATION
+    STOP_GENERATION = False
+    
     if not CURRENT_MODEL:
-        yield "⚠️ Please LOAD a model first!"
+        yield "⚠️ NO MODEL LOADED\n\nPlease initialize a model first."
         return
-
-    # === GGUF ENGINE ===
+    
+    if not prompt.strip():
+        yield "⚠️ Empty prompt"
+        return
+    
+    start_time = time.time()
+    token_count = 0
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # GGUF ENGINE
+    # ═══════════════════════════════════════════════════════════════════════════
     if CURRENT_ENGINE == "gguf":
-        stream = CURRENT_MODEL(
-            prompt, 
-            max_tokens=max_tokens, 
-            temperature=temp, 
-            top_k=top_k, 
-            stream=True
-        )
-        partial_text = ""
-        for output in stream:
-            token = output['choices'][0]['text']
-            partial_text += token
-            yield partial_text
-
-    # === NATIVE ENGINE ===
+        try:
+            stream = CURRENT_MODEL(
+                prompt,
+                max_tokens=int(max_tokens),
+                temperature=float(temperature),
+                top_k=int(top_k),
+                top_p=float(top_p),
+                stream=True
+            )
+            
+            partial = ""
+            for output in stream:
+                if STOP_GENERATION:
+                    partial += "\n\n⏹️ [GENERATION STOPPED]"
+                    yield partial
+                    return
+                    
+                token = output['choices'][0]['text']
+                partial += token
+                token_count += 1
+                yield partial
+                
+        except Exception as e:
+            yield f"❌ GGUF Generation Error: {str(e)}"
+            return
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # NATIVE ENGINE
+    # ═══════════════════════════════════════════════════════════════════════════
     else:
-        device, _, attn_ctx = get_device_config(device_idx)
-        idx = torch.tensor(ENC.encode(prompt)).unsqueeze(0).to(device)
+        device, _, attn_ctx = get_device_config(int(device_idx))
         
-        partial_text = prompt
-        
-        CURRENT_MODEL.eval()
-        with torch.no_grad(), attn_ctx:
-            for _ in range(max_tokens):
-                # Handle context window limits
-                if idx.size(1) > CURRENT_MODEL.config.block_size:
-                    idx_cond = idx[:, -CURRENT_MODEL.config.block_size:]
-                else:
-                    idx_cond = idx
+        try:
+            # Encode prompt
+            tokens = ENC.encode(prompt)
+            idx = torch.tensor([tokens], dtype=torch.long, device=device)
+            
+            partial = prompt
+            
+            CURRENT_MODEL.eval()
+            with torch.no_grad(), attn_ctx:
+                for _ in range(int(max_tokens)):
+                    if STOP_GENERATION:
+                        partial += "\n\n⏹️ [GENERATION STOPPED]"
+                        yield partial
+                        return
                     
-                logits, _ = CURRENT_MODEL(idx_cond)
-                logits = logits[:, -1, :] / temp
-                
-                if top_k > 0:
-                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                    logits[logits < v[:, [-1]]] = -float('Inf')
+                    # Crop to context window
+                    block_size = CURRENT_MODEL.config.block_size
+                    idx_cond = idx if idx.size(1) <= block_size else idx[:, -block_size:]
                     
-                probs = F.softmax(logits, dim=-1)
-                idx_next = torch.multinomial(probs, num_samples=1)
-                
-                token = ENC.decode([idx_next.item()])
-                partial_text += token
-                idx = torch.cat((idx, idx_next), dim=1)
-                
-                yield partial_text
+                    # Forward pass
+                    logits, _ = CURRENT_MODEL(idx_cond)
+                    logits = logits[:, -1, :] / float(temperature)
+                    
+                    # Top-K filtering
+                    if top_k > 0:
+                        v, _ = torch.topk(logits, min(int(top_k), logits.size(-1)))
+                        logits[logits < v[:, [-1]]] = float('-inf')
+                    
+                    # Top-P (nucleus) filtering
+                    if top_p < 1.0:
+                        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                        
+                        # Remove tokens with cumulative prob above threshold
+                        sorted_indices_to_remove = cumulative_probs > top_p
+                        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                        sorted_indices_to_remove[..., 0] = 0
+                        
+                        indices_to_remove = sorted_indices_to_remove.scatter(
+                            dim=-1, index=sorted_indices, src=sorted_indices_to_remove
+                        )
+                        logits[indices_to_remove] = float('-inf')
+                    
+                    # Sample
+                    probs = F.softmax(logits, dim=-1)
+                    idx_next = torch.multinomial(probs, num_samples=1)
+                    
+                    # Decode and yield
+                    token_str = ENC.decode([idx_next.item()])
+                    partial += token_str
+                    token_count += 1
+                    
+                    idx = torch.cat((idx, idx_next), dim=1)
+                    yield partial
+                    
+        except Exception as e:
+            yield f"❌ Native Generation Error: {str(e)}"
+            return
+    
+    # Final stats
+    elapsed = time.time() - start_time
+    tps = token_count / elapsed if elapsed > 0 else 0
+    yield partial + f"\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n⚡ {token_count} tokens in {elapsed:.1f}s ({tps:.1f} tok/s)"
 
-# --- UI LOGIC ---
+# ═══════════════════════════════════════════════════════════════════════════════
+# UI HANDLERS
+# ═══════════════════════════════════════════════════════════════════════════════
 def ui_load(engine, path, gpu, ctx):
+    """Handle model loading from UI"""
+    if not path.strip():
+        return "❌ No path specified"
     if not os.path.exists(path):
         return f"❌ File not found: {path}"
-        
+    
     if engine == "Native (.pt)":
         return load_native(path, int(gpu))
     else:
         return load_gguf(path, int(gpu), int(ctx))
 
-# --- LAYOUT ---
+def ui_get_stats(gpu):
+    """Update GPU stats display"""
+    return get_gpu_stats(int(gpu))
+
+def get_system_info():
+    """Get system information for display"""
+    gpus = get_gpu_info()
+    info = "╔═══════════════════════════════════════╗\n"
+    info += "║        SYSTEM DIAGNOSTICS             ║\n"
+    info += "╠═══════════════════════════════════════╣\n"
+    
+    for gpu in gpus:
+        if gpu['id'] == -1:
+            info += f"║  CPU Mode Active                      ║\n"
+        else:
+            status = "⚡" if gpu.get('is_modern', False) else "⚠️"
+            info += f"║  GPU {gpu['id']}: {gpu['name'][:25]:<25} ║\n"
+            info += f"║    Memory: {gpu['memory']:.1f} GB | SM: {gpu['compute']:<5} {status}  ║\n"
+    
+    info += "╚═══════════════════════════════════════╝"
+    return info
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CYBERPUNK CSS THEME
+# ═══════════════════════════════════════════════════════════════════════════════
 CSS = """
-body { background: #0b0f19; }
-.gradio-container { max-width: 1200px !important; }
-.panel { background: rgba(30, 41, 59, 0.8); border: 1px solid rgba(255,255,255,0.1); border-radius: 12px; padding: 20px; }
-.title { font-family: 'Orbitron', sans-serif; color: #00f3ff; text-align: center; font-size: 2rem; margin-bottom: 1rem; }
+/* ═══════════════════════════════════════════════════════════════════════════ */
+/* LLM UI - CYBERPUNK INTERFACE                                                */
+/* ═══════════════════════════════════════════════════════════════════════════ */
+
+@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Share+Tech+Mono&display=swap');
+
+:root {
+    --neon-cyan: #00f3ff;
+    --neon-magenta: #ff00ff;
+    --neon-yellow: #f3ff00;
+    --dark-bg: #0a0e17;
+    --panel-bg: rgba(15, 23, 42, 0.95);
+    --border-glow: rgba(0, 243, 255, 0.3);
+}
+
+body {
+    background: linear-gradient(135deg, #0a0e17 0%, #1a1a2e 50%, #0a0e17 100%) !important;
+    background-attachment: fixed !important;
+}
+
+.gradio-container {
+    max-width: 1400px !important;
+    font-family: 'Share Tech Mono', monospace !important;
+}
+
+/* HEADER */
+.title-banner {
+    background: linear-gradient(90deg, transparent, var(--panel-bg), transparent);
+    border: 1px solid var(--border-glow);
+    border-radius: 8px;
+    padding: 20px;
+    margin-bottom: 20px;
+    text-align: center;
+    position: relative;
+    overflow: hidden;
+}
+
+.title-banner::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: -100%;
+    width: 100%;
+    height: 2px;
+    background: linear-gradient(90deg, transparent, var(--neon-cyan), transparent);
+    animation: scan-line 3s linear infinite;
+}
+
+@keyframes scan-line {
+    0% { left: -100%; }
+    100% { left: 100%; }
+}
+
+.title-text {
+    font-family: 'Orbitron', sans-serif !important;
+    font-size: 2.5rem !important;
+    font-weight: 900 !important;
+    background: linear-gradient(90deg, var(--neon-cyan), var(--neon-magenta), var(--neon-cyan));
+    background-size: 200% auto;
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    animation: gradient-shift 3s ease infinite;
+    text-shadow: 0 0 30px rgba(0, 243, 255, 0.5);
+    margin: 0;
+}
+
+@keyframes gradient-shift {
+    0% { background-position: 0% center; }
+    50% { background-position: 100% center; }
+    100% { background-position: 0% center; }
+}
+
+.subtitle {
+    color: rgba(255, 255, 255, 0.6);
+    font-size: 0.9rem;
+    margin-top: 8px;
+}
+
+/* PANELS */
+.panel-container {
+    background: var(--panel-bg) !important;
+    border: 1px solid var(--border-glow) !important;
+    border-radius: 12px !important;
+    padding: 20px !important;
+    backdrop-filter: blur(10px);
+    box-shadow: 
+        0 0 20px rgba(0, 243, 255, 0.1),
+        inset 0 0 60px rgba(0, 0, 0, 0.3);
+}
+
+/* SECTION HEADERS */
+.section-header {
+    font-family: 'Orbitron', sans-serif !important;
+    color: var(--neon-cyan) !important;
+    font-size: 1rem !important;
+    font-weight: 700;
+    border-bottom: 1px solid var(--border-glow);
+    padding-bottom: 10px;
+    margin-bottom: 15px;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+}
+
+/* INPUTS */
+.gradio-textbox textarea, .gradio-textbox input {
+    background: rgba(0, 10, 20, 0.8) !important;
+    border: 1px solid var(--border-glow) !important;
+    color: #e0e0e0 !important;
+    font-family: 'Share Tech Mono', monospace !important;
+    border-radius: 6px !important;
+}
+
+.gradio-textbox textarea:focus, .gradio-textbox input:focus {
+    border-color: var(--neon-cyan) !important;
+    box-shadow: 0 0 15px rgba(0, 243, 255, 0.3) !important;
+}
+
+/* BUTTONS */
+.primary-btn {
+    background: linear-gradient(135deg, rgba(0, 243, 255, 0.2), rgba(255, 0, 255, 0.2)) !important;
+    border: 1px solid var(--neon-cyan) !important;
+    color: var(--neon-cyan) !important;
+    font-family: 'Orbitron', sans-serif !important;
+    font-weight: 700 !important;
+    text-transform: uppercase !important;
+    letter-spacing: 2px !important;
+    transition: all 0.3s ease !important;
+    border-radius: 6px !important;
+}
+
+.primary-btn:hover {
+    background: linear-gradient(135deg, rgba(0, 243, 255, 0.4), rgba(255, 0, 255, 0.4)) !important;
+    box-shadow: 0 0 30px rgba(0, 243, 255, 0.5) !important;
+    transform: translateY(-2px);
+}
+
+.stop-btn {
+    background: rgba(255, 50, 50, 0.2) !important;
+    border: 1px solid #ff3232 !important;
+    color: #ff3232 !important;
+}
+
+.stop-btn:hover {
+    background: rgba(255, 50, 50, 0.4) !important;
+    box-shadow: 0 0 20px rgba(255, 50, 50, 0.5) !important;
+}
+
+/* SLIDERS */
+.gradio-slider input[type="range"] {
+    accent-color: var(--neon-cyan) !important;
+}
+
+/* OUTPUT DISPLAY */
+.output-display textarea {
+    background: rgba(0, 5, 15, 0.9) !important;
+    border: 1px solid rgba(0, 243, 255, 0.2) !important;
+    color: #00ff88 !important;
+    font-family: 'Share Tech Mono', monospace !important;
+    font-size: 0.95rem !important;
+    line-height: 1.6 !important;
+}
+
+/* STATUS BOX */
+.status-display textarea {
+    background: rgba(0, 20, 40, 0.9) !important;
+    border: 1px solid rgba(0, 243, 255, 0.3) !important;
+    color: var(--neon-cyan) !important;
+    font-family: 'Share Tech Mono', monospace !important;
+    font-size: 0.85rem !important;
+}
+
+/* GPU STATS */
+.stats-display {
+    font-family: 'Share Tech Mono', monospace !important;
+    color: var(--neon-yellow) !important;
+    background: rgba(0, 0, 0, 0.5) !important;
+    padding: 8px 12px !important;
+    border-radius: 4px !important;
+    border: 1px solid rgba(243, 255, 0, 0.3) !important;
+}
+
+/* DROPDOWN */
+.gradio-dropdown {
+    background: rgba(0, 10, 20, 0.8) !important;
+}
+
+/* SCROLLBAR */
+::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+
+::-webkit-scrollbar-track {
+    background: rgba(0, 0, 0, 0.3);
+}
+
+::-webkit-scrollbar-thumb {
+    background: var(--border-glow);
+    border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: var(--neon-cyan);
+}
+
+/* LABELS */
+label {
+    color: rgba(255, 255, 255, 0.8) !important;
+    font-family: 'Share Tech Mono', monospace !important;
+}
 """
 
-with gr.Blocks(css=CSS, theme=gr.themes.Soft()) as demo:
-    gr.HTML('<div class="title">SOVRA OMNI INTERFACE</div>')
+# ═══════════════════════════════════════════════════════════════════════════════
+# GRADIO INTERFACE
+# ═══════════════════════════════════════════════════════════════════════════════
+with gr.Blocks(css=CSS, title="SOVRA OMNI") as demo:
+    
+    # HEADER
+    gr.HTML("""
+        <div class="title-banner">
+            <h1 class="title-text">SOVRA OMNI</h1>
+            <p class="subtitle">Neural Interface v2.0 │ LLM Inference Engine</p>
+        </div>
+    """)
     
     with gr.Row():
-        # CONTROLS
-        with gr.Column(scale=1, variant="panel"):
-            gr.Markdown("### 🔌 Model Loader")
-            engine_drop = gr.Radio(["Native (.pt)", "GGUF (.gguf)"], label="Engine", value="Native (.pt)")
-            path_input = gr.Textbox(label="File Path", value="checkpoints/latest.pt")
+        # ═══════════════════════════════════════════════════════════════════════
+        # LEFT PANEL - CONTROLS
+        # ═══════════════════════════════════════════════════════════════════════
+        with gr.Column(scale=1):
+            gr.HTML('<div class="section-header">⚡ System Control</div>')
             
-            with gr.Row():
-                gpu_drop = gr.Dropdown(["0", "1"], label="GPU Index", value=str(ARGS_DEVICE))
-                ctx_slider = gr.Slider(512, 8192, value=2048, step=256, label="Context (GGUF Only)")
+            # Model Selection
+            with gr.Group(elem_classes="panel-container"):
+                engine_radio = gr.Radio(
+                    ["Native (.pt)", "GGUF (.gguf)"],
+                    label="Engine Type",
+                    value="Native (.pt)"
+                )
+                
+                model_path = gr.Textbox(
+                    label="Model Path",
+                    value="checkpoints/latest.pt",
+                    placeholder="/path/to/model"
+                )
+                
+                with gr.Row():
+                    gpu_dropdown = gr.Dropdown(
+                        choices=[str(i) for i in range(torch.cuda.device_count() or 1)],
+                        value=str(ARGS_DEVICE),
+                        label="GPU"
+                    )
+                    ctx_slider = gr.Slider(
+                        512, 8192, value=2048, step=256,
+                        label="Context (GGUF)"
+                    )
+                
+                load_btn = gr.Button(
+                    "⚡ INITIALIZE NEURAL LINK",
+                    elem_classes="primary-btn"
+                )
             
-            load_btn = gr.Button("INITIALIZE SYSTEM", variant="primary")
-            status_box = gr.Textbox(label="System Status", interactive=False)
-            
-        # CHAT
+            # Status Display
+            gr.HTML('<div class="section-header">📊 System Status</div>')
+            with gr.Group(elem_classes="panel-container"):
+                status_box = gr.Textbox(
+                    label="",
+                    lines=10,
+                    interactive=False,
+                    elem_classes="status-display",
+                    value=get_system_info()
+                )
+                
+                gpu_stats = gr.Textbox(
+                    label="GPU Memory",
+                    interactive=False,
+                    elem_classes="stats-display",
+                    value=get_gpu_stats(ARGS_DEVICE)
+                )
+                
+                refresh_btn = gr.Button("🔄 Refresh Stats", size="sm")
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # RIGHT PANEL - GENERATION
+        # ═══════════════════════════════════════════════════════════════════════
         with gr.Column(scale=2):
-            chatbot = gr.Textbox(label="Neural Feed", lines=20, interactive=False)
-            msg = gr.Textbox(label="Input", placeholder="Transmit data...")
-            with gr.Row():
-                temp_slide = gr.Slider(0.1, 2.0, 0.8, label="Temperature")
-                max_slide = gr.Slider(10, 1000, 200, label="Max Tokens")
+            gr.HTML('<div class="section-header">🧠 Neural Output</div>')
             
-            send_btn = gr.Button("SEND", variant="secondary")
-
-    # WIRING
-    load_btn.click(ui_load, [engine_drop, path_input, gpu_drop, ctx_slider], status_box)
+            with gr.Group(elem_classes="panel-container"):
+                output_box = gr.Textbox(
+                    label="",
+                    lines=18,
+                    interactive=False,
+                    elem_classes="output-display",
+                    placeholder="Awaiting neural transmission..."
+                )
+            
+            gr.HTML('<div class="section-header">📝 Input Terminal</div>')
+            with gr.Group(elem_classes="panel-container"):
+                input_box = gr.Textbox(
+                    label="",
+                    lines=3,
+                    placeholder="Enter prompt for neural processing...",
+                )
+                
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        temp_slider = gr.Slider(
+                            0.1, 2.0, value=0.8, step=0.05,
+                            label="Temperature"
+                        )
+                    with gr.Column(scale=1):
+                        max_tokens_slider = gr.Slider(
+                            10, 2000, value=256, step=10,
+                            label="Max Tokens"
+                        )
+                
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        top_k_slider = gr.Slider(
+                            0, 500, value=50, step=5,
+                            label="Top-K (0=disabled)"
+                        )
+                    with gr.Column(scale=1):
+                        top_p_slider = gr.Slider(
+                            0.0, 1.0, value=0.95, step=0.01,
+                            label="Top-P (nucleus)"
+                        )
+                
+                with gr.Row():
+                    generate_btn = gr.Button(
+                        "🚀 TRANSMIT",
+                        elem_classes="primary-btn"
+                    )
+                    stop_btn = gr.Button(
+                        "⏹️ HALT",
+                        elem_classes="stop-btn"
+                    )
     
-    # Pass GPU index to generation so it knows where to put the input tensors
-    send_btn.click(generate, [msg, max_slide, temp_slide, max_slide, gpu_drop], chatbot)
-    msg.submit(generate, [msg, max_slide, temp_slide, max_slide, gpu_drop], chatbot)
+    # ═══════════════════════════════════════════════════════════════════════════
+    # EVENT HANDLERS
+    # ═══════════════════════════════════════════════════════════════════════════
+    load_btn.click(
+        ui_load,
+        inputs=[engine_radio, model_path, gpu_dropdown, ctx_slider],
+        outputs=status_box
+    )
+    
+    refresh_btn.click(
+        ui_get_stats,
+        inputs=[gpu_dropdown],
+        outputs=gpu_stats
+    )
+    
+    # FIX: Now passing correct parameters (top_k instead of max_tokens twice)
+    generate_btn.click(
+        generate,
+        inputs=[input_box, max_tokens_slider, temp_slider, top_k_slider, top_p_slider, gpu_dropdown],
+        outputs=output_box
+    )
+    
+    input_box.submit(
+        generate,
+        inputs=[input_box, max_tokens_slider, temp_slider, top_k_slider, top_p_slider, gpu_dropdown],
+        outputs=output_box
+    )
+    
+    stop_btn.click(stop_generation, outputs=status_box)
+    
+    # Auto-refresh GPU stats periodically
+    demo.load(
+        ui_get_stats,
+        inputs=[gpu_dropdown],
+        outputs=gpu_stats,
+    )
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# LAUNCH
+# ═══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    print(f"🚀 Launching LLM UI on Port {args.port}...")
-    demo.queue().launch(server_name="0.0.0.0", server_port=args.port, share=args.share)
+    print(f"""
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║  LLM UI - Initializing...                                                     ║
+╠═══════════════════════════════════════════════════════════════════════════════╣
+║  Port:   {args.port:<6}                                                       ║
+║  Share:  {str(args.share):<6}                                                 ║
+║  GPU:    {ARGS_DEVICE:<6}                                                     ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+    """)
+    
+    demo.queue().launch(
+        server_name="0.0.0.0",
+        server_port=args.port,
+        share=args.share
+    )
