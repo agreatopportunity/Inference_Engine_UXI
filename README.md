@@ -1,5 +1,5 @@
 
-````markdown
+```markdown
 # 🌌 Universal AI Interface
 
 **The "Holo-Glass" Cognitive Interface for your custom LLaMA-3 models.**
@@ -14,7 +14,7 @@ Before running the UI, you must install the interface libraries.
 ### 1. Activate your Environment
 ```bash
 conda activate myLLM
-````
+```
 
 ### 2\. Install Core Dependencies
 
