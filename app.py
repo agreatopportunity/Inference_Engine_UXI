@@ -1,27 +1,32 @@
 """
 ╔═══════════════════════════════════════════════════════════════════════════════╗
-║  SOVRA OMNI v2.0 - Neural Interface for LLM Inference                         ║
+║  SOVRA OMNI v3.0 - Neural Interface for LLM Inference                         ║
 ║  ─────────────────────────────────────────────────────────────────────────────║
 ║  Supports:                                                                    ║
 ║    • Native Models (.pt) - Custom LLaMA-3 architecture                        ║
-║    • GGUF Models (.gguf) - DeepSeek, Llama, Mistral, etc.                     ║
+║    • GGUF Models (.gguf) - DeepSeek, Llama, Mistral, Qwen3, etc.             ║
+║    • Voice Input/Output - Speech-to-text and TTS                              ║
+║    • Training Interface - Fine-tune models                                    ║
 ║                                                                               ║
 ║  Features:                                                                    ║
+║    • Mobile & Desktop responsive design                                       ║
+║    • Dark/Light theme toggle                                                  ║
 ║    • Real-time streaming generation                                           ║
 ║    • GPU memory monitoring                                                    ║
 ║    • Multi-GPU support                                                        ║
-║    • Automatic precision selection (FP16/BF16)                                ║
+║    • HuggingFace model downloader                                             ║
 ╚═══════════════════════════════════════════════════════════════════════════════╝
 """
 import gradio as gr
 import torch
-import torch.nn.functional as F  # FIX: This was missing!
+import torch.nn.functional as F
 import tiktoken
 import contextlib
 import argparse
 import os
 import sys
 import time
+import json
 import threading
 import subprocess
 import urllib.request
@@ -43,14 +48,11 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] in ['-h', '--help']:
         print("""
 ╔═══════════════════════════════════════════════════════════════════════════════╗
-║  SOVRA OMNI v2.0 - Command Line Arguments                                     ║
+║  SOVRA OMNI v3.0 - Command Line Arguments                                     ║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
 ║                                                                               ║
 ║  --device_id  : GPU Index to use (Default: 0)                                 ║
-║                 Use 'nvidia-smi' to check your GPU indices                    ║
-║                                                                               ║
 ║  --port       : Port to run the UI on (Default: 7860)                         ║
-║                                                                               ║
 ║  --share      : Create a public Gradio share link                             ║
 ║                                                                               ║
 ║  Example: python3 app.py --device_id 0 --port 7860 --share                    ║
@@ -90,149 +92,151 @@ except ImportError:
 # GLOBAL STATE
 # ═══════════════════════════════════════════════════════════════════════════════
 CURRENT_MODEL = None
-CURRENT_ENGINE = None  # "native" or "gguf"
+CURRENT_ENGINE = None
 MODEL_INFO = {}
 ENC = None
 STOP_GENERATION = False
-CURRENT_TEMPLATE = "None (Raw)"  # Track current chat template
-DOWNLOAD_PROGRESS = {"status": "", "progress": 0}  # Track download progress
+CURRENT_TEMPLATE = "None (Raw)"
+DOWNLOAD_PROGRESS = {"status": "", "progress": 0}
+VOICE_ENABLED = False
+TRAINING_ACTIVE = False
 
-# Models directory (same folder as app.py)
+# Models directory
 MODELS_DIR = Path(__file__).parent / "models"
 MODELS_DIR.mkdir(exist_ok=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MODEL CATALOG - Popular GGUF models for download
+# MODEL CATALOG - December 2025 (Optimized for 12GB VRAM)
 # ═══════════════════════════════════════════════════════════════════════════════
 MODEL_CATALOG = {
-    "═══ 🔥 NEW! Qwen3 (Dec 2025) ═══": None,  # Section header
-    "⭐ Qwen3-8B (Q5_K_M, 5.9GB) - RECOMMENDED": {
+    "🔥 Qwen3-8B Q5_K_M (5.9GB) ⭐ RECOMMENDED": {
         "repo": "unsloth/Qwen3-8B-GGUF",
         "file": "Qwen3-8B-Q5_K_M.gguf",
         "size": "5.9 GB",
-        "type": "chat"
+        "type": "chat",
+        "desc": "Latest Qwen3, supports /think mode"
     },
-    "Qwen3-8B (Q4_K_M, 5.0GB) - Faster": {
+    "🔥 Qwen3-8B Q4_K_M (5.0GB) - Faster": {
         "repo": "unsloth/Qwen3-8B-GGUF",
         "file": "Qwen3-8B-Q4_K_M.gguf",
         "size": "5.0 GB",
-        "type": "chat"
+        "type": "chat",
+        "desc": "Qwen3 with faster inference"
     },
-    "Qwen3-4B (Q8_0, 4.7GB) - Best Small": {
+    "🔥 Qwen3-4B Q8_0 (4.7GB) - Best Small": {
         "repo": "unsloth/Qwen3-4B-GGUF",
         "file": "Qwen3-4B-Q8_0.gguf",
         "size": "4.7 GB",
-        "type": "chat"
+        "type": "chat",
+        "desc": "Compact but powerful"
     },
-    "Qwen3-4B-2507 (Q5_K_M, 2.8GB) - Latest Update": {
-        "repo": "unsloth/Qwen3-4B-Instruct-2507-GGUF",
-        "file": "Qwen3-4B-Instruct-2507-Q5_K_M.gguf",
-        "size": "2.8 GB",
-        "type": "chat"
-    },
-    "═══ 🧠 Reasoning Models ═══": None,
-    "⭐ DeepSeek-R1-Qwen3-8B (Q5_K_M, 5.9GB) - SOTA Reasoning": {
+    "🧠 DeepSeek-R1-Qwen3-8B Q5 (5.9GB) ⭐ REASONING": {
         "repo": "unsloth/DeepSeek-R1-0528-Qwen3-8B-GGUF",
         "file": "DeepSeek-R1-0528-Qwen3-8B-Q5_K_M.gguf",
         "size": "5.9 GB",
-        "type": "chat"
+        "type": "reasoning",
+        "desc": "SOTA reasoning, AIME champion"
     },
-    "DeepSeek-R1-Qwen3-8B (Q4_K_M, 5.0GB) - Faster": {
+    "🧠 DeepSeek-R1-Qwen3-8B Q4 (5.0GB) - Faster": {
         "repo": "unsloth/DeepSeek-R1-0528-Qwen3-8B-GGUF",
         "file": "DeepSeek-R1-0528-Qwen3-8B-Q4_K_M.gguf",
         "size": "5.0 GB",
-        "type": "chat"
+        "type": "reasoning",
+        "desc": "Fast reasoning model"
     },
-    "═══ 💻 Code Models ═══": None,
-    "⭐ Qwen2.5-Coder-7B (Q5_K_M, 5.4GB) - Best for 12GB": {
+    "💻 Qwen2.5-Coder-7B Q5 (5.4GB) ⭐ CODE": {
         "repo": "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
         "file": "qwen2.5-coder-7b-instruct-q5_k_m.gguf",
         "size": "5.4 GB",
-        "type": "code"
+        "type": "code",
+        "desc": "Best open-source code model"
     },
-    "Qwen2.5-Coder-7B (Q8_0, 8.1GB) - Higher Quality": {
+    "💻 Qwen2.5-Coder-7B Q8 (8.1GB) - HQ Code": {
         "repo": "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
         "file": "qwen2.5-coder-7b-instruct-q8_0.gguf",
         "size": "8.1 GB",
-        "type": "code"
+        "type": "code",
+        "desc": "Higher quality code generation"
     },
-    "Qwen2.5-Coder-3B (Q8_0, 3.6GB) - Fast Code": {
+    "💻 Qwen2.5-Coder-3B Q8 (3.6GB) - Fast Code": {
         "repo": "Qwen/Qwen2.5-Coder-3B-Instruct-GGUF",
         "file": "qwen2.5-coder-3b-instruct-q8_0.gguf",
         "size": "3.6 GB",
-        "type": "code"
+        "type": "code",
+        "desc": "Fast coding assistant"
     },
-    "Qwen2.5-Coder-1.5B (Q8_0, 1.7GB) - Ultra Fast Code": {
-        "repo": "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF",
-        "file": "qwen2.5-coder-1.5b-instruct-q8_0.gguf",
-        "size": "1.7 GB",
-        "type": "code"
-    },
-    "═══ 🦙 Llama 3.2 ═══": None,
-    "Llama-3.2-3B-Instruct (Q5_K_M, 2.3GB)": {
+    "🦙 Llama-3.2-3B Q5 (2.3GB)": {
         "repo": "bartowski/Llama-3.2-3B-Instruct-GGUF",
         "file": "Llama-3.2-3B-Instruct-Q5_K_M.gguf",
         "size": "2.3 GB",
-        "type": "chat"
+        "type": "chat",
+        "desc": "Meta's efficient model"
     },
-    "Llama-3.2-3B-Instruct (Q8_0, 3.4GB) - Higher Quality": {
+    "🦙 Llama-3.2-3B Q8 (3.4GB) - Higher Quality": {
         "repo": "bartowski/Llama-3.2-3B-Instruct-GGUF",
         "file": "Llama-3.2-3B-Instruct-Q8_0.gguf",
         "size": "3.4 GB",
-        "type": "chat"
+        "type": "chat",
+        "desc": "Better quality Llama"
     },
-    "Llama-3.2-1B-Instruct (Q8_0, 1.3GB) - Ultra Fast": {
+    "🦙 Llama-3.2-1B Q8 (1.3GB) - Ultra Fast": {
         "repo": "bartowski/Llama-3.2-1B-Instruct-GGUF",
         "file": "Llama-3.2-1B-Instruct-Q8_0.gguf",
         "size": "1.3 GB",
-        "type": "chat"
+        "type": "chat",
+        "desc": "Fastest Llama model"
     },
-    "═══ 🌟 Other Great Models ═══": None,
-    "Mistral-7B-Instruct-v0.3 (Q5_K_M, 5.1GB)": {
+    "🌟 Mistral-7B-v0.3 Q5 (5.1GB)": {
         "repo": "bartowski/Mistral-7B-Instruct-v0.3-GGUF",
         "file": "Mistral-7B-Instruct-v0.3-Q5_K_M.gguf",
         "size": "5.1 GB",
-        "type": "chat"
+        "type": "chat",
+        "desc": "Reliable general assistant"
     },
-    "Qwen2.5-7B-Instruct (Q5_K_M, 5.4GB)": {
+    "🌟 Qwen2.5-7B Q5 (5.4GB)": {
         "repo": "Qwen/Qwen2.5-7B-Instruct-GGUF",
         "file": "qwen2.5-7b-instruct-q5_k_m.gguf",
         "size": "5.4 GB",
-        "type": "chat"
+        "type": "chat",
+        "desc": "Strong multilingual model"
     },
-    "Phi-3.5-mini-instruct (Q5_K_M, 2.8GB) - Microsoft": {
+    "🌟 Phi-3.5-mini Q5 (2.8GB) - Microsoft": {
         "repo": "bartowski/Phi-3.5-mini-instruct-GGUF",
         "file": "Phi-3.5-mini-instruct-Q5_K_M.gguf",
         "size": "2.8 GB",
-        "type": "chat"
+        "type": "chat",
+        "desc": "Microsoft's efficient model"
     },
-    "Gemma-2-9B-Instruct (Q4_K_M, 5.8GB) - Google": {
+    "🌟 Gemma-2-9B Q4 (5.8GB) - Google": {
         "repo": "bartowski/gemma-2-9b-it-GGUF",
         "file": "gemma-2-9b-it-Q4_K_M.gguf",
         "size": "5.8 GB",
-        "type": "chat"
+        "type": "chat",
+        "desc": "Google's powerful model"
     },
-    "═══ ⚡ Small & Fast ═══": None,
-    "SmolLM2-1.7B-Instruct (Q8_0, 1.8GB)": {
+    "⚡ SmolLM2-1.7B Q8 (1.8GB) - Tiny": {
         "repo": "bartowski/SmolLM2-1.7B-Instruct-GGUF",
         "file": "SmolLM2-1.7B-Instruct-Q8_0.gguf",
         "size": "1.8 GB",
-        "type": "chat"
+        "type": "chat",
+        "desc": "Surprisingly capable tiny model"
     },
-    "TinyLlama-1.1B-Chat (Q8_0, 1.2GB)": {
+    "⚡ TinyLlama-1.1B Q8 (1.2GB) - Fastest": {
         "repo": "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
         "file": "tinyllama-1.1b-chat-v1.0.Q8_0.gguf",
         "size": "1.2 GB",
-        "type": "chat"
+        "type": "chat",
+        "desc": "Minimum viable LLM"
     },
 }
 
 def get_model_list():
-    """Get list of model names for dropdown"""
     return list(MODEL_CATALOG.keys())
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# DOWNLOAD FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════════
 def download_model_hf(repo_id: str, filename: str, progress_callback=None):
-    """Download model using huggingface_hub"""
     global DOWNLOAD_PROGRESS
     
     if not HF_HUB_AVAILABLE:
@@ -258,23 +262,20 @@ def download_model_hf(repo_id: str, filename: str, progress_callback=None):
         return None, str(e)
 
 def download_model_direct(url: str, filename: str, progress_callback=None):
-    """Download model using urllib with progress"""
     global DOWNLOAD_PROGRESS
     
     output_path = MODELS_DIR / filename
     
     try:
-        DOWNLOAD_PROGRESS["status"] = f"Connecting to {url[:50]}..."
+        DOWNLOAD_PROGRESS["status"] = f"Connecting..."
         DOWNLOAD_PROGRESS["progress"] = 5
         
-        # Get file size
         req = urllib.request.Request(url, method='HEAD')
         with urllib.request.urlopen(req, timeout=30) as response:
             total_size = int(response.headers.get('content-length', 0))
         
-        # Download with progress
         downloaded = 0
-        block_size = 1024 * 1024  # 1MB chunks
+        block_size = 1024 * 1024
         
         with urllib.request.urlopen(url, timeout=60) as response:
             with open(output_path, 'wb') as out_file:
@@ -300,41 +301,36 @@ def download_model_direct(url: str, filename: str, progress_callback=None):
     except Exception as e:
         DOWNLOAD_PROGRESS["status"] = f"Error: {str(e)}"
         if output_path.exists():
-            output_path.unlink()  # Clean up partial download
+            output_path.unlink()
         return None, str(e)
 
 def ui_download_model(model_selection, custom_repo, custom_file):
-    """Handle model download from UI"""
     global DOWNLOAD_PROGRESS
     DOWNLOAD_PROGRESS = {"status": "Starting...", "progress": 0}
     
-    # Check if using custom or catalog
     if custom_repo.strip() and custom_file.strip():
         repo_id = custom_repo.strip()
         filename = custom_file.strip()
         model_name = filename
     elif model_selection and model_selection in MODEL_CATALOG:
         model_info = MODEL_CATALOG[model_selection]
-        if model_info is None:  # Section header
-            return "❌ Please select a model, not a section header", ""
+        if model_info is None:
+            return "❌ Please select a model", ""
         repo_id = model_info["repo"]
         filename = model_info["file"]
         model_name = model_selection
     else:
         return "❌ Please select a model or enter custom repo/file", ""
     
-    # Check if already exists
     local_path = MODELS_DIR / filename
     if local_path.exists():
-        return f"✅ Model already exists!\n\n📁 Path: {local_path}", str(local_path)
+        return f"✅ Model already exists!\n📁 {local_path}", str(local_path)
     
-    # Download
-    yield f"⏳ Downloading: {model_name}\n📦 Repo: {repo_id}\n📄 File: {filename}\n\nThis may take several minutes...", ""
+    yield f"⏳ Downloading: {model_name}\n📦 {repo_id}\n📄 {filename}\n\nThis may take several minutes...", ""
     
     if HF_HUB_AVAILABLE:
         path, error = download_model_hf(repo_id, filename)
     else:
-        # Construct direct URL
         url = f"https://huggingface.co/{repo_id}/resolve/main/{filename}"
         path, error = download_model_direct(url, filename)
     
@@ -342,114 +338,103 @@ def ui_download_model(model_selection, custom_repo, custom_file):
         yield f"❌ Download failed: {error}", ""
     else:
         final_path = MODELS_DIR / filename
-        yield f"✅ Download complete!\n\n📁 Path: {final_path}\n💡 Click 'Use This Model' or copy path to Model Path field", str(final_path)
+        yield f"✅ Download complete!\n📁 {final_path}\n\n💡 Click 'Use This Model' to load it", str(final_path)
 
 def ui_use_downloaded(model_path):
-    """Set the downloaded model path in the model_path field"""
     if model_path:
         return model_path
     return ""
 
 def ui_list_local_models():
-    """List models in the models directory"""
     if not MODELS_DIR.exists():
         return "No models directory found"
     
     models = list(MODELS_DIR.glob("*.gguf"))
     if not models:
-        return "No GGUF models found in models/ directory"
+        return "📭 No GGUF models downloaded yet\n\nSelect a model above and click Download!"
     
-    result = "📁 Local Models:\n" + "━" * 40 + "\n"
+    result = "📁 Downloaded Models:\n" + "─" * 35 + "\n"
     for m in sorted(models):
         size_gb = m.stat().st_size / (1024**3)
-        result += f"• {m.name} ({size_gb:.1f} GB)\n"
+        result += f"• {m.name}\n  ({size_gb:.1f} GB)\n"
     
     return result
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CHAT TEMPLATES - Auto-wrap prompts for different model types
+# CHAT TEMPLATES
 # ═══════════════════════════════════════════════════════════════════════════════
 CHAT_TEMPLATES = {
     "None (Raw)": {
         "format": "{prompt}",
         "description": "No template - raw prompt",
-        "detect": []  # No auto-detection patterns
+        "detect": []
+    },
+    "Qwen3": {
+        "format": "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n",
+        "description": "Qwen3 (supports /think)",
+        "detect": ["qwen3"]
     },
     "Llama-2/Mistral": {
         "format": "[INST] {prompt} [/INST]",
-        "description": "Llama-2-Chat, Mistral-Instruct",
+        "description": "Llama-2, Mistral",
         "detect": ["llama-2", "mistral", "mixtral", "inst"]
     },
     "Llama-3": {
         "format": "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
-        "description": "Llama-3-Instruct models",
+        "description": "Llama-3-Instruct",
         "detect": ["llama-3", "llama3"]
     },
-    "ChatML (Qwen/Yi)": {
+    "ChatML (Qwen2/Yi)": {
         "format": "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n",
-        "description": "Qwen, Yi, OpenHermes",
-        "detect": ["qwen", "yi-", "chatml", "hermes"]
+        "description": "Qwen2, Yi, OpenHermes",
+        "detect": ["qwen2", "qwen-", "yi-", "chatml", "hermes"]
     },
     "DeepSeek": {
         "format": "### Instruction:\n{prompt}\n\n### Response:\n",
-        "description": "DeepSeek, DeepSeek-Coder",
-        "detect": ["deepseek"]
+        "description": "DeepSeek-Coder",
+        "detect": ["deepseek-coder"]
     },
-    "DeepSeek-V2/V3": {
+    "DeepSeek-V2/V3/R1": {
         "format": "<|begin▁of▁sentence|><|User|>{prompt}<|Assistant|>",
-        "description": "DeepSeek-V2, V3 models",
+        "description": "DeepSeek-V2/V3/R1",
         "detect": ["deepseek-v2", "deepseek-v3", "deepseek-r1"]
-    },
-    "Alpaca": {
-        "format": "### Instruction:\n{prompt}\n\n### Response:\n",
-        "description": "Alpaca-style models",
-        "detect": ["alpaca"]
-    },
-    "Vicuna": {
-        "format": "USER: {prompt}\nASSISTANT:",
-        "description": "Vicuna models",
-        "detect": ["vicuna"]
     },
     "Phi-3": {
         "format": "<|user|>\n{prompt}<|end|>\n<|assistant|>\n",
-        "description": "Microsoft Phi-3 models",
+        "description": "Microsoft Phi-3",
         "detect": ["phi-3", "phi3"]
     },
     "Gemma": {
         "format": "<start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n",
-        "description": "Google Gemma models",
+        "description": "Google Gemma",
         "detect": ["gemma"]
     },
-    "Command-R": {
-        "format": "<|START_OF_TURN_TOKEN|><|USER_TOKEN|>{prompt}<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>",
-        "description": "Cohere Command-R models",
-        "detect": ["command-r"]
+    "Alpaca": {
+        "format": "### Instruction:\n{prompt}\n\n### Response:\n",
+        "description": "Alpaca-style",
+        "detect": ["alpaca"]
     },
-    "Zephyr": {
-        "format": "<|user|>\n{prompt}</s>\n<|assistant|>\n",
-        "description": "Zephyr models",
-        "detect": ["zephyr"]
+    "Vicuna": {
+        "format": "USER: {prompt}\nASSISTANT:",
+        "description": "Vicuna",
+        "detect": ["vicuna"]
     },
 }
 
 def detect_template(model_path: str) -> str:
-    """Auto-detect chat template from model filename"""
     filename = os.path.basename(model_path).lower()
     
-    # Priority order: Check specific patterns first, generic patterns last
-    # This prevents "inst" from matching before "deepseek"
     priority_order = [
-        "DeepSeek-V2/V3",    # Check deepseek-v2/v3/r1 first
-        "DeepSeek",          # Then regular deepseek
-        "Llama-3",           # Check llama-3 before generic llama
-        "Phi-3",             # Check phi-3 before generic patterns
-        "ChatML (Qwen/Yi)",  # Qwen, Yi
+        "Qwen3",
+        "DeepSeek-V2/V3/R1",
+        "DeepSeek",
+        "Llama-3",
+        "Phi-3",
+        "ChatML (Qwen2/Yi)",
         "Gemma",
-        "Command-R",
-        "Zephyr",
         "Vicuna",
         "Alpaca",
-        "Llama-2/Mistral",   # Generic inst/mistral patterns LAST
+        "Llama-2/Mistral",
     ]
     
     for template_name in priority_order:
@@ -462,17 +447,15 @@ def detect_template(model_path: str) -> str:
     return "None (Raw)"
 
 def apply_template(prompt: str, template_name: str) -> str:
-    """Apply chat template to prompt"""
     if template_name not in CHAT_TEMPLATES:
         return prompt
     template = CHAT_TEMPLATES[template_name]["format"]
     return template.format(prompt=prompt)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# HARDWARE DETECTION & CONFIGURATION
+# HARDWARE DETECTION
 # ═══════════════════════════════════════════════════════════════════════════════
 def get_gpu_info():
-    """Get detailed GPU information"""
     if not torch.cuda.is_available():
         return [{"id": -1, "name": "CPU Only", "memory": 0, "compute": "N/A"}]
     
@@ -489,9 +472,8 @@ def get_gpu_info():
     return gpus
 
 def get_gpu_stats(device_id=0):
-    """Get real-time GPU statistics"""
     if not torch.cuda.is_available():
-        return "CPU Mode - No GPU Stats"
+        return "CPU Mode"
     
     try:
         torch.cuda.synchronize()
@@ -500,16 +482,15 @@ def get_gpu_stats(device_id=0):
         total = torch.cuda.get_device_properties(device_id).total_memory / 1e9
         
         usage_pct = (allocated / total) * 100
-        bar_len = 20
+        bar_len = 15
         filled = int(bar_len * usage_pct / 100)
         bar = "█" * filled + "░" * (bar_len - filled)
         
-        return f"VRAM: [{bar}] {allocated:.1f}/{total:.1f} GB ({usage_pct:.0f}%)"
+        return f"[{bar}] {allocated:.1f}/{total:.1f}GB ({usage_pct:.0f}%)"
     except Exception as e:
-        return f"Stats Error: {e}"
+        return f"Error: {e}"
 
 def get_device_config(device_id):
-    """Configure device with optimal settings"""
     if not torch.cuda.is_available():
         return "cpu", "float32", contextlib.nullcontext()
     
@@ -517,15 +498,12 @@ def get_device_config(device_id):
     try:
         props = torch.cuda.get_device_properties(device)
         
-        # Auto-select precision based on GPU architecture
-        if props.major < 8:  # Pre-Ampere (Titan V, 1080, 2080, etc.)
+        if props.major < 8:
             dtype = "float16"
-            # Use newer API if available (PyTorch 2.2+), fallback to deprecated
             try:
                 from torch.nn.attention import sdpa_kernel, SDPBackend
                 attn = sdpa_kernel([SDPBackend.MATH, SDPBackend.EFFICIENT_ATTENTION])
             except ImportError:
-                # Fallback for older PyTorch versions
                 import warnings
                 warnings.filterwarnings("ignore", message=".*sdp_kernel.*deprecated.*")
                 attn = torch.backends.cuda.sdp_kernel(
@@ -533,7 +511,7 @@ def get_device_config(device_id):
                     enable_math=True, 
                     enable_mem_efficient=True
                 )
-        else:  # Ampere+ (3090, 4060 Ti, 4090, etc.)
+        else:
             dtype = "bfloat16"
             attn = contextlib.nullcontext()
             
@@ -546,7 +524,6 @@ def get_device_config(device_id):
 # MODEL LOADERS
 # ═══════════════════════════════════════════════════════════════════════════════
 def load_native(path, device_idx):
-    """Load native PyTorch model (.pt)"""
     global CURRENT_MODEL, ENC, CURRENT_ENGINE, MODEL_INFO
     
     if not NATIVE_AVAILABLE:
@@ -557,20 +534,16 @@ def load_native(path, device_idx):
     try:
         ckpt = torch.load(path, map_location='cpu', weights_only=False)
         
-        # Extract config
         if isinstance(ckpt['model_config'], dict):
             conf = GPTConfig(**ckpt['model_config'])
         else:
             conf = ckpt['model_config']
         
-        # Build model
         model = GPT(conf)
         
-        # Clean state dict (remove torch.compile prefix)
         state_dict = {k.replace('_orig_mod.', ''): v for k, v in ckpt['model'].items()}
         model.load_state_dict(state_dict)
         
-        # Apply precision
         if dtype == 'float16':
             model.half()
         elif dtype == 'bfloat16':
@@ -579,7 +552,6 @@ def load_native(path, device_idx):
         model.to(device)
         model.eval()
         
-        # Calculate parameters
         params = sum(p.numel() for p in model.parameters())
         
         CURRENT_MODEL = model
@@ -595,32 +567,28 @@ def load_native(path, device_idx):
             "device": device
         }
         
-        return f"""✅ NEURAL LINK ESTABLISHED
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Model:      {MODEL_INFO['name']}
-Parameters: {MODEL_INFO['params']}
-Layers:     {MODEL_INFO['layers']}
-Heads:      {MODEL_INFO['heads']}
-Context:    {MODEL_INFO['ctx']}
-Precision:  {dtype.upper()}
-Device:     {device}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+        return f"""✅ Model Loaded Successfully
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📦 {MODEL_INFO['name']}
+🔢 {MODEL_INFO['params']} parameters
+📊 {MODEL_INFO['layers']} layers, {MODEL_INFO['heads']} heads
+📐 {MODEL_INFO['ctx']} context
+⚡ {dtype.upper()} on {device}"""
         
     except Exception as e:
-        return f"❌ LOAD FAILED: {str(e)}"
+        return f"❌ Load Failed: {str(e)}"
 
 def load_gguf(path, device_idx, n_ctx):
-    """Load GGUF model via llama.cpp"""
     global CURRENT_MODEL, CURRENT_ENGINE, MODEL_INFO
     
     if not GGUF_AVAILABLE:
-        return "❌ GGUF engine unavailable (pip install llama-cpp-python)"
+        return "❌ GGUF unavailable (pip install llama-cpp-python)"
     
     try:
         model = Llama(
             model_path=path,
             n_ctx=n_ctx,
-            n_gpu_layers=-1,  # Offload all layers to GPU
+            n_gpu_layers=-1,
             main_gpu=device_idx,
             verbose=False
         )
@@ -634,66 +602,59 @@ def load_gguf(path, device_idx, n_ctx):
             "device": f"cuda:{device_idx}"
         }
         
-        return f"""✅ GGUF CORE INITIALIZED
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Model:   {MODEL_INFO['name']}
-Context: {n_ctx}
-GPU:     {device_idx}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+        return f"""✅ GGUF Model Loaded
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📦 {MODEL_INFO['name']}
+📐 {n_ctx} context length
+🖥️ GPU {device_idx}"""
         
     except Exception as e:
-        return f"❌ GGUF LOAD FAILED: {str(e)}"
+        return f"❌ GGUF Load Failed: {str(e)}"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # GENERATION ENGINE
 # ═══════════════════════════════════════════════════════════════════════════════
 def stop_generation():
-    """Signal to stop generation"""
     global STOP_GENERATION
     STOP_GENERATION = True
-    return "⏹️ Stop signal sent..."
+    return "⏹️ Stopping..."
 
 def generate(prompt, max_tokens, temperature, top_k, top_p, repeat_penalty, template_name, device_idx):
-    """Stream tokens from loaded model"""
     global STOP_GENERATION
     STOP_GENERATION = False
     
     if not CURRENT_MODEL:
-        yield "⚠️ NO MODEL LOADED\n\nPlease initialize a model first."
+        yield "⚠️ No model loaded. Please load a model first."
         return
     
     if not prompt.strip():
-        yield "⚠️ Empty prompt"
+        yield "⚠️ Please enter a prompt"
         return
     
-    # Apply chat template
     formatted_prompt = apply_template(prompt, template_name)
     
     start_time = time.time()
     token_count = 0
     
-    # ═══════════════════════════════════════════════════════════════════════════
-    # GGUF ENGINE
-    # ═══════════════════════════════════════════════════════════════════════════
     if CURRENT_ENGINE == "gguf":
         try:
             stream = CURRENT_MODEL(
-                formatted_prompt,  # Use formatted prompt with template
+                formatted_prompt,
                 max_tokens=int(max_tokens),
                 temperature=float(temperature),
                 top_k=int(top_k),
                 top_p=float(top_p),
-                repeat_penalty=float(repeat_penalty),  # From slider - prevents repetition!
-                frequency_penalty=0.0,     # Additional repetition control
-                presence_penalty=0.0,      # Additional repetition control
+                repeat_penalty=float(repeat_penalty),
+                frequency_penalty=0.0,
+                presence_penalty=0.0,
                 stream=True,
-                stop=["</s>", "<|endoftext|>", "<|im_end|>", "<|eot_id|>", "<end_of_turn>", "</s>", "\n\n\n"]  # Common stop tokens
+                stop=["</s>", "<|endoftext|>", "<|im_end|>", "<|eot_id|>", "<end_of_turn>", "</s>", "\n\n\n"]
             )
             
             partial = ""
             for output in stream:
                 if STOP_GENERATION:
-                    partial += "\n\n⏹️ [GENERATION STOPPED]"
+                    partial += "\n\n⏹️ [Stopped]"
                     yield partial
                     return
                     
@@ -703,17 +664,12 @@ def generate(prompt, max_tokens, temperature, top_k, top_p, repeat_penalty, temp
                 yield partial
                 
         except Exception as e:
-            yield f"❌ GGUF Generation Error: {str(e)}"
+            yield f"❌ Generation Error: {str(e)}"
             return
-    
-    # ═══════════════════════════════════════════════════════════════════════════
-    # NATIVE ENGINE
-    # ═══════════════════════════════════════════════════════════════════════════
     else:
         device, _, attn_ctx = get_device_config(int(device_idx))
         
         try:
-            # Encode prompt (with template applied)
             tokens = ENC.encode(formatted_prompt)
             idx = torch.tensor([tokens], dtype=torch.long, device=device)
             
@@ -723,29 +679,24 @@ def generate(prompt, max_tokens, temperature, top_k, top_p, repeat_penalty, temp
             with torch.no_grad(), attn_ctx:
                 for _ in range(int(max_tokens)):
                     if STOP_GENERATION:
-                        partial += "\n\n⏹️ [GENERATION STOPPED]"
+                        partial += "\n\n⏹️ [Stopped]"
                         yield partial
                         return
                     
-                    # Crop to context window
                     block_size = CURRENT_MODEL.config.block_size
                     idx_cond = idx if idx.size(1) <= block_size else idx[:, -block_size:]
                     
-                    # Forward pass
                     logits, _ = CURRENT_MODEL(idx_cond)
                     logits = logits[:, -1, :] / float(temperature)
                     
-                    # Top-K filtering
                     if top_k > 0:
                         v, _ = torch.topk(logits, min(int(top_k), logits.size(-1)))
                         logits[logits < v[:, [-1]]] = float('-inf')
                     
-                    # Top-P (nucleus) filtering
                     if top_p < 1.0:
                         sorted_logits, sorted_indices = torch.sort(logits, descending=True)
                         cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
                         
-                        # Remove tokens with cumulative prob above threshold
                         sorted_indices_to_remove = cumulative_probs > top_p
                         sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
                         sorted_indices_to_remove[..., 0] = 0
@@ -755,11 +706,9 @@ def generate(prompt, max_tokens, temperature, top_k, top_p, repeat_penalty, temp
                         )
                         logits[indices_to_remove] = float('-inf')
                     
-                    # Sample
                     probs = F.softmax(logits, dim=-1)
                     idx_next = torch.multinomial(probs, num_samples=1)
                     
-                    # Decode and yield
                     token_str = ENC.decode([idx_next.item()])
                     partial += token_str
                     token_count += 1
@@ -768,19 +717,17 @@ def generate(prompt, max_tokens, temperature, top_k, top_p, repeat_penalty, temp
                     yield partial
                     
         except Exception as e:
-            yield f"❌ Native Generation Error: {str(e)}"
+            yield f"❌ Generation Error: {str(e)}"
             return
     
-    # Final stats
     elapsed = time.time() - start_time
     tps = token_count / elapsed if elapsed > 0 else 0
-    yield partial + f"\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n⚡ {token_count} tokens in {elapsed:.1f}s ({tps:.1f} tok/s)"
+    yield partial + f"\n\n─────────────────────\n⚡ {token_count} tokens • {elapsed:.1f}s • {tps:.1f} tok/s"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # UI HANDLERS
 # ═══════════════════════════════════════════════════════════════════════════════
 def ui_load(engine, path, gpu, ctx):
-    """Handle model loading from UI - returns (status_msg, detected_template)"""
     global CURRENT_TEMPLATE
     
     if not path.strip():
@@ -788,453 +735,688 @@ def ui_load(engine, path, gpu, ctx):
     if not os.path.exists(path):
         return f"❌ File not found: {path}", "None (Raw)"
     
-    # Auto-detect chat template from filename
     detected = detect_template(path)
     CURRENT_TEMPLATE = detected
-    template_msg = f"\n💬 Auto-detected template: {detected}" if detected != "None (Raw)" else ""
+    template_msg = f"\n💬 Template: {detected}" if detected != "None (Raw)" else ""
     
-    # Auto-detect engine based on file extension (prevents mismatched loading)
     path_lower = path.lower()
     if path_lower.endswith('.gguf'):
         if engine == "Native (.pt)":
-            msg = load_gguf(path, int(gpu), int(ctx)) + "\n⚠️ Auto-switched to GGUF engine" + template_msg
+            msg = load_gguf(path, int(gpu), int(ctx)) + "\n⚠️ Auto-switched to GGUF" + template_msg
             return msg, detected
         return load_gguf(path, int(gpu), int(ctx)) + template_msg, detected
     elif path_lower.endswith('.pt') or path_lower.endswith('.pth'):
         if engine == "GGUF (.gguf)":
-            msg = load_native(path, int(gpu)) + "\n⚠️ Auto-switched to Native engine" + template_msg
+            msg = load_native(path, int(gpu)) + "\n⚠️ Auto-switched to Native" + template_msg
             return msg, detected
         return load_native(path, int(gpu)) + template_msg, detected
     else:
-        # Fall back to user selection for unknown extensions
         if engine == "Native (.pt)":
             return load_native(path, int(gpu)) + template_msg, detected
         else:
             return load_gguf(path, int(gpu), int(ctx)) + template_msg, detected
 
 def ui_get_stats(gpu):
-    """Update GPU stats display"""
     return get_gpu_stats(int(gpu))
 
 def get_system_info():
-    """Get system information for display"""
     gpus = get_gpu_info()
-    info = "╔═══════════════════════════════════════╗\n"
-    info += "║        SYSTEM DIAGNOSTICS             ║\n"
-    info += "╠═══════════════════════════════════════╣\n"
+    info = "🖥️ System Info\n" + "─" * 30 + "\n"
     
     for gpu in gpus:
         if gpu['id'] == -1:
-            info += f"║  CPU Mode Active                      ║\n"
+            info += "CPU Mode Active\n"
         else:
             status = "⚡" if gpu.get('is_modern', False) else "⚠️"
-            info += f"║  GPU {gpu['id']}: {gpu['name'][:25]:<25} ║\n"
-            info += f"║    Memory: {gpu['memory']:.1f} GB | SM: {gpu['compute']:<5} {status}  ║\n"
+            info += f"GPU {gpu['id']}: {gpu['name'][:20]}\n"
+            info += f"  {gpu['memory']:.1f}GB • SM {gpu['compute']} {status}\n"
     
-    info += "╚═══════════════════════════════════════╝"
     return info
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CYBERPUNK CSS THEME (FIXED RADIO BUTTONS)
+# VOICE FUNCTIONS (Placeholder - requires browser API)
+# ═══════════════════════════════════════════════════════════════════════════════
+def process_voice_input(audio):
+    """Process voice input - placeholder for speech-to-text"""
+    if audio is None:
+        return ""
+    # In a full implementation, this would use Whisper or similar
+    return "[Voice input received - Speech-to-text processing would happen here]"
+
+def generate_voice_output(text):
+    """Generate voice output - placeholder for TTS"""
+    # In a full implementation, this would use TTS
+    return f"🔊 Would speak: {text[:100]}..."
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TRAINING FUNCTIONS (Placeholder)
+# ═══════════════════════════════════════════════════════════════════════════════
+def start_training(dataset_path, epochs, batch_size, learning_rate, save_path):
+    """Start training - placeholder"""
+    global TRAINING_ACTIVE
+    
+    if not dataset_path.strip():
+        return "❌ Please specify a dataset path"
+    
+    TRAINING_ACTIVE = True
+    
+    result = f"""🏋️ Training Configuration
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📂 Dataset: {dataset_path}
+🔄 Epochs: {epochs}
+📦 Batch Size: {batch_size}
+📈 Learning Rate: {learning_rate}
+💾 Save Path: {save_path}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+⚠️ Training interface is a placeholder.
+To actually train, use train_llama3.py directly:
+
+python train_llama3.py --epochs {epochs} --batch_size {batch_size}
+
+Full training integration coming in v3.1!"""
+    
+    TRAINING_ACTIVE = False
+    return result
+
+def stop_training():
+    """Stop training"""
+    global TRAINING_ACTIVE
+    TRAINING_ACTIVE = False
+    return "⏹️ Training stopped"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CSS - Modern, Responsive, Theme-aware
 # ═══════════════════════════════════════════════════════════════════════════════
 
 CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Share+Tech+Mono&display=swap');
+/* Fonts loaded via HTML link tag instead of @import */
 
 :root {
-    --neon-cyan: #00f3ff;
-    --neon-magenta: #ff00ff;
-    --neon-yellow: #f3ff00;
-    --dark-bg: #0a0e17;
-    --panel-bg: rgba(15, 23, 42, 0.95);
-    --border-glow: rgba(0, 243, 255, 0.3);
+    --bg-primary: #0f1419;
+    --bg-secondary: #1a1f2e;
+    --bg-tertiary: #242b3d;
+    --bg-card: #1e2433;
+    --bg-input: #161b26;
+    --text-primary: #e8eaed;
+    --text-secondary: #9aa0a6;
+    --text-muted: #5f6368;
+    --accent-primary: #00d4ff;
+    --accent-secondary: #7c4dff;
+    --accent-success: #00e676;
+    --accent-warning: #ffab00;
+    --accent-danger: #ff5252;
+    --border-color: rgba(255, 255, 255, 0.1);
+    --border-glow: rgba(0, 212, 255, 0.3);
+    --shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.3);
+    --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.4);
+    --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.5);
+    --radius-sm: 8px;
+    --radius-md: 12px;
+    --radius-lg: 16px;
+    --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
 }
 
-body {
-    background: linear-gradient(135deg, #0a0e17 0%, #1a1a2e 50%, #0a0e17 100%) !important;
-    background-attachment: fixed !important;
+.light-theme {
+    --bg-primary: #f8f9fa;
+    --bg-secondary: #ffffff;
+    --bg-tertiary: #e9ecef;
+    --bg-card: #ffffff;
+    --bg-input: #f1f3f4;
+    --text-primary: #202124;
+    --text-secondary: #5f6368;
+    --text-muted: #9aa0a6;
+    --accent-primary: #0066cc;
+    --accent-secondary: #6200ee;
+    --border-color: rgba(0, 0, 0, 0.1);
+    --border-glow: rgba(0, 102, 204, 0.3);
+    --shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.08);
+    --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.12);
+    --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.16);
+}
+
+body, .gradio-container {
+    background: var(--bg-primary) !important;
+    font-family: var(--font-sans) !important;
+    color: var(--text-primary) !important;
 }
 
 .gradio-container {
-    max-width: 1400px !important;
-    font-family: 'Share Tech Mono', monospace !important;
+    max-width: 1600px !important;
+    margin: 0 auto !important;
+    padding: 16px !important;
 }
 
-/* HEADER */
-.title-banner {
-    background: linear-gradient(90deg, transparent, var(--panel-bg), transparent);
-    border: 1px solid var(--border-glow);
-    border-radius: 8px;
-    padding: 20px;
-    margin-bottom: 20px;
+.header-container {
+    background: linear-gradient(135deg, var(--bg-secondary), var(--bg-tertiary));
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-lg);
+    padding: 24px;
+    margin-bottom: 24px;
     text-align: center;
-    position: relative;
-    overflow: hidden;
+    box-shadow: var(--shadow-md);
 }
 
-.title-text {
-    font-family: 'Orbitron', sans-serif !important;
-    font-size: 2.5rem !important;
-    font-weight: 900 !important;
-    background: linear-gradient(90deg, var(--neon-cyan), var(--neon-magenta), var(--neon-cyan));
-    background-size: 200% auto;
+.header-title {
+    font-size: 2.5rem;
+    font-weight: 700;
+    background: linear-gradient(135deg, var(--accent-primary), var(--accent-secondary));
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
-    animation: gradient-shift 3s ease infinite;
+    background-clip: text;
+    margin: 0 0 8px 0;
+}
+
+.header-subtitle {
+    color: var(--text-secondary);
+    font-size: 1rem;
     margin: 0;
 }
 
-@keyframes gradient-shift {
-    0% { background-position: 0% center; }
-    50% { background-position: 100% center; }
-    100% { background-position: 0% center; }
+.header-badges {
+    display: flex;
+    justify-content: center;
+    gap: 12px;
+    margin-top: 16px;
+    flex-wrap: wrap;
 }
 
-.subtitle {
-    color: rgba(255, 255, 255, 0.6);
-    font-size: 0.9rem;
-    margin-top: 8px;
+.badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 12px;
+    background: var(--bg-tertiary);
+    border-radius: 20px;
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    border: 1px solid var(--border-color);
 }
 
-/* PANELS */
-.panel-container {
-    background: var(--panel-bg) !important;
-    border: 1px solid var(--border-glow) !important;
-    border-radius: 12px !important;
+.card {
+    background: var(--bg-card) !important;
+    border: 1px solid var(--border-color) !important;
+    border-radius: var(--radius-md) !important;
     padding: 20px !important;
-    backdrop-filter: blur(10px);
-    box-shadow: 0 0 20px rgba(0, 243, 255, 0.1);
+    box-shadow: var(--shadow-sm);
 }
 
-/* SECTION HEADERS */
-.section-header {
-    font-family: 'Orbitron', sans-serif !important;
-    color: var(--neon-cyan) !important;
-    font-size: 1rem !important;
-    font-weight: 700;
-    border-bottom: 1px solid var(--border-glow);
-    padding-bottom: 10px;
-    margin-bottom: 15px;
+.section-title {
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--accent-primary);
     text-transform: uppercase;
-    letter-spacing: 2px;
+    letter-spacing: 1px;
+    margin-bottom: 16px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border-color);
 }
 
-/* INPUTS */
-.gradio-textbox textarea, .gradio-textbox input {
-    background: rgba(0, 10, 20, 0.8) !important;
-    border: 1px solid var(--border-glow) !important;
-    color: #e0e0e0 !important;
-    font-family: 'Share Tech Mono', monospace !important;
+.gradio-textbox textarea,
+.gradio-textbox input,
+input[type="text"],
+textarea {
+    background: var(--bg-input) !important;
+    border: 1px solid var(--border-color) !important;
+    border-radius: var(--radius-sm) !important;
+    color: var(--text-primary) !important;
+    font-family: var(--font-mono) !important;
+    font-size: 0.95rem !important;
+    padding: 12px !important;
 }
 
-/* RADIO BUTTONS & LABELS (FIXED VISIBILITY) */
+.gradio-textbox textarea:focus,
+.gradio-textbox input:focus {
+    border-color: var(--accent-primary) !important;
+    box-shadow: 0 0 0 3px rgba(0, 212, 255, 0.15) !important;
+}
+
+label, .label-wrap span {
+    color: var(--text-secondary) !important;
+    font-weight: 500 !important;
+    font-size: 0.9rem !important;
+}
+
+.gradio-dropdown select,
+.gradio-dropdown input {
+    background: var(--bg-input) !important;
+    border: 1px solid var(--border-color) !important;
+    border-radius: var(--radius-sm) !important;
+    color: var(--text-primary) !important;
+    padding: 12px !important;
+    font-size: 0.95rem !important;
+}
+
+.gradio-dropdown ul,
+.gradio-dropdown .options {
+    background: var(--bg-card) !important;
+    border: 1px solid var(--border-color) !important;
+    border-radius: var(--radius-sm) !important;
+    box-shadow: var(--shadow-lg) !important;
+    max-height: 300px !important;
+    overflow-y: auto !important;
+    z-index: 9999 !important;
+}
+
+.gradio-dropdown li,
+.gradio-dropdown .option {
+    padding: 12px 16px !important;
+    color: var(--text-primary) !important;
+    cursor: pointer;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.gradio-dropdown li:hover,
+.gradio-dropdown .option:hover {
+    background: var(--bg-tertiary) !important;
+}
+
 .gradio-radio {
-    background: transparent !important;
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
 }
-/* The radio circle itself */
+
+.gradio-radio label {
+    display: flex !important;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 16px;
+    background: var(--bg-input);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+}
+
+.gradio-radio label:hover {
+    border-color: var(--accent-primary);
+}
+
 .gradio-radio input[type="radio"] {
-    accent-color: var(--neon-cyan) !important;
+    accent-color: var(--accent-primary);
 }
-/* The text label next to the radio button */
+
 .gradio-radio label span {
-    color: var(--neon-cyan) !important;
-    font-family: 'Orbitron', sans-serif !important;
-    font-weight: 700 !important;
-    font-size: 1.1rem !important;
-    text-shadow: 0 0 10px rgba(0, 243, 255, 0.3);
-}
-/* General Labels */
-label span {
-    color: rgba(255, 255, 255, 0.9) !important;
-    font-family: 'Share Tech Mono', monospace !important;
+    color: var(--text-primary) !important;
+    font-weight: 500 !important;
 }
 
-/* BUTTONS */
-.primary-btn {
-    background: linear-gradient(135deg, rgba(0, 243, 255, 0.2), rgba(255, 0, 255, 0.2)) !important;
-    border: 1px solid var(--neon-cyan) !important;
-    color: var(--neon-cyan) !important;
-    font-family: 'Orbitron', sans-serif !important;
-    font-weight: 700 !important;
-}
-.primary-btn:hover {
-    box-shadow: 0 0 30px rgba(0, 243, 255, 0.5) !important;
-}
-
-.stop-btn {
-    background: rgba(255, 50, 50, 0.2) !important;
-    border: 1px solid #ff3232 !important;
-    color: #ff3232 !important;
-}
-
-/* SLIDERS */
 .gradio-slider input[type="range"] {
-    accent-color: var(--neon-cyan) !important;
+    accent-color: var(--accent-primary);
 }
 
-/* STATUS & OUTPUT */
-.status-display textarea {
-    background: rgba(0, 20, 40, 0.9) !important;
-    color: var(--neon-cyan) !important;
-    border: 1px solid rgba(0, 243, 255, 0.3) !important;
+button, .btn {
+    font-family: var(--font-sans) !important;
+    font-weight: 600 !important;
+    border-radius: var(--radius-sm) !important;
+    padding: 12px 24px !important;
+    transition: all 0.2s ease !important;
 }
-.output-display textarea {
-    background: rgba(0, 5, 15, 0.9) !important;
-    color: #00ff88 !important;
-    border: 1px solid rgba(0, 243, 255, 0.2) !important;
+
+.btn-primary, button.primary {
+    background: linear-gradient(135deg, var(--accent-primary), var(--accent-secondary)) !important;
+    border: none !important;
+    color: white !important;
+}
+
+.btn-primary:hover, button.primary:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 6px 20px rgba(0, 212, 255, 0.4) !important;
+}
+
+.btn-secondary {
+    background: var(--bg-tertiary) !important;
+    border: 1px solid var(--border-color) !important;
+    color: var(--text-primary) !important;
+}
+
+.btn-danger {
+    background: rgba(255, 82, 82, 0.15) !important;
+    border: 1px solid var(--accent-danger) !important;
+    color: var(--accent-danger) !important;
+}
+
+.btn-success {
+    background: rgba(0, 230, 118, 0.15) !important;
+    border: 1px solid var(--accent-success) !important;
+    color: var(--accent-success) !important;
+}
+
+.output-box textarea {
+    background: var(--bg-primary) !important;
+    border: 1px solid var(--border-color) !important;
+    border-radius: var(--radius-md) !important;
+    color: var(--accent-success) !important;
+    font-family: var(--font-mono) !important;
     font-size: 1rem !important;
+    line-height: 1.6 !important;
+    padding: 20px !important;
 }
 
-/* Accordion styling */
-.gradio-accordion {
-    background: var(--panel-bg) !important;
-    border: 1px solid var(--border-glow) !important;
-    border-radius: 8px !important;
-    margin-bottom: 15px;
+.status-box textarea {
+    background: var(--bg-secondary) !important;
+    border: 1px solid var(--border-color) !important;
+    color: var(--accent-primary) !important;
+    font-family: var(--font-mono) !important;
 }
+
+.gradio-accordion {
+    background: var(--bg-card) !important;
+    border: 1px solid var(--border-color) !important;
+    border-radius: var(--radius-md) !important;
+    margin-bottom: 16px;
+}
+
 .gradio-accordion summary {
-    color: var(--neon-cyan) !important;
-    font-family: 'Share Tech Mono', monospace !important;
+    background: var(--bg-tertiary) !important;
+    padding: 14px 20px !important;
+    color: var(--text-primary) !important;
+    font-weight: 600 !important;
+}
+
+.gradio-tabs > div:first-child {
+    background: var(--bg-secondary) !important;
+    border-radius: var(--radius-md) var(--radius-md) 0 0 !important;
+    padding: 8px !important;
+    border: 1px solid var(--border-color) !important;
+    border-bottom: none !important;
+    gap: 8px !important;
+    flex-wrap: wrap;
+}
+
+.gradio-tabs button {
+    background: transparent !important;
+    border: none !important;
+    color: var(--text-secondary) !important;
+    padding: 12px 20px !important;
+    border-radius: var(--radius-sm) !important;
+    font-weight: 500 !important;
+}
+
+.gradio-tabs button.selected {
+    background: var(--bg-card) !important;
+    color: var(--accent-primary) !important;
+}
+
+.gradio-tabs > div:last-child {
+    background: var(--bg-card) !important;
+    border: 1px solid var(--border-color) !important;
+    border-top: none !important;
+    border-radius: 0 0 var(--radius-md) var(--radius-md) !important;
+    padding: 24px !important;
+}
+
+@media (max-width: 768px) {
+    .gradio-container { padding: 12px !important; }
+    .header-title { font-size: 1.8rem; }
+    .gradio-row { flex-direction: column !important; }
+    .gradio-column { width: 100% !important; max-width: 100% !important; }
+    .card { padding: 16px !important; }
+    .gradio-tabs button { padding: 10px 16px !important; font-size: 0.9rem !important; }
+    button, .btn { padding: 10px 16px !important; }
+}
+
+@media (max-width: 480px) {
+    .header-title { font-size: 1.5rem; }
+    .gradio-radio { flex-direction: column; }
+    .gradio-radio label { width: 100%; }
+}
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: var(--bg-secondary); border-radius: 4px; }
+::-webkit-scrollbar-thumb { background: var(--bg-tertiary); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--accent-primary); }
+"""
+
+THEME_JS = """
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+    #theme-toggle-btn {
+        position: fixed;
+        top: 16px;
+        right: 16px;
+        z-index: 1000;
+        background: var(--bg-card, #1e2433);
+        border: 1px solid var(--border-color, rgba(255,255,255,0.1));
+        border-radius: 50%;
+        width: 48px;
+        height: 48px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        cursor: pointer;
+        box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+        font-size: 1.2rem;
+        transition: all 0.3s ease;
+        user-select: none;
+    }
+    #theme-toggle-btn:hover {
+        transform: scale(1.1);
+        border-color: var(--accent-primary, #00d4ff);
+    }
+    @media (max-width: 768px) {
+        #theme-toggle-btn {
+            top: auto;
+            bottom: 16px;
+            width: 44px;
+            height: 44px;
+        }
+    }
+</style>
+"""
+
+# Theme toggle button with inline JavaScript (Gradio doesn't execute <script> tags)
+THEME_TOGGLE_HTML = '''
+<div id="theme-toggle-btn" onclick="
+    var body = document.body;
+    var container = document.querySelector('.gradio-container');
+    var btn = this;
+    if (body.classList.contains('light-theme')) {
+        body.classList.remove('light-theme');
+        if (container) container.classList.remove('light-theme');
+        btn.textContent = '🌙';
+        localStorage.setItem('sovra-theme', 'dark');
+    } else {
+        body.classList.add('light-theme');
+        if (container) container.classList.add('light-theme');
+        btn.textContent = '☀️';
+        localStorage.setItem('sovra-theme', 'light');
+    }
+">🌙</div>
+'''
+
+# JavaScript to run on page load (Gradio executes this properly)
+LOAD_THEME_JS = """
+function() {
+    // Load saved theme
+    var savedTheme = localStorage.getItem('sovra-theme');
+    if (savedTheme === 'light') {
+        document.body.classList.add('light-theme');
+        var container = document.querySelector('.gradio-container');
+        if (container) container.classList.add('light-theme');
+        var btn = document.getElementById('theme-toggle-btn');
+        if (btn) btn.textContent = '☀️';
+    }
+    return [];
 }
 """
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # GRADIO INTERFACE
 # ═══════════════════════════════════════════════════════════════════════════════
-# Create theme that uses web-safe fonts (prevents 404s for ui-sans-serif, system-ui)
-cyberpunk_theme = gr.themes.Base(
-    primary_hue="cyan",
-    secondary_hue="purple", 
-    neutral_hue="slate",
-    font=gr.themes.GoogleFont("Share Tech Mono"),
-    font_mono=gr.themes.GoogleFont("Share Tech Mono"),
-)
-
-with gr.Blocks(css=CSS, theme=cyberpunk_theme, title="SOVRA OMNI") as demo:
+with gr.Blocks(css=CSS, title="SOVRA OMNI v3.0", theme=gr.themes.Base(), js=LOAD_THEME_JS) as demo:
     
-    # HEADER
+    gr.HTML(THEME_JS + THEME_TOGGLE_HTML)
+    
     gr.HTML("""
-        <div class="title-banner">
-            <h1 class="title-text">SOVRA OMNI</h1>
-            <p class="subtitle">Neural Interface v2.1 │ LLM Inference Engine</p>
+        <div class="header-container">
+            <h1 class="header-title">SOVRA OMNI</h1>
+            <p class="header-subtitle">Neural Interface for LLM Inference • v3.0</p>
+            <div class="header-badges">
+                <span class="badge">🚀 GGUF Support</span>
+                <span class="badge">🎯 Native .pt Models</span>
+                <span class="badge">📥 Model Downloader</span>
+                <span class="badge">🏋️ Training</span>
+            </div>
         </div>
     """)
     
-    with gr.Row():
-        # ═══════════════════════════════════════════════════════════════════════
-        # LEFT PANEL - CONTROLS
-        # ═══════════════════════════════════════════════════════════════════════
-        with gr.Column(scale=1):
-            gr.HTML('<div class="section-header">⚡ System Control</div>')
-            
-            # Model Selection
-            with gr.Group(elem_classes="panel-container"):
-                engine_radio = gr.Radio(
-                    ["Native (.pt)", "GGUF (.gguf)"],
-                    label="Engine Type",
-                    value="Native (.pt)"
-                )
-                
-                model_path = gr.Textbox(
-                    label="Model Path",
-                    value="checkpoints/latest.pt",
-                    placeholder="/path/to/model"
-                )
-                
-                with gr.Row():
-                    gpu_dropdown = gr.Dropdown(
-                        choices=[str(i) for i in range(torch.cuda.device_count() or 1)],
-                        value=str(ARGS_DEVICE),
-                        label="GPU"
-                    )
-                    ctx_slider = gr.Slider(
-                        512, 8192, value=2048, step=256,
-                        label="Context (GGUF)"
-                    )
-                
-                load_btn = gr.Button(
-                    "⚡ INITIALIZE NEURAL LINK",
-                    elem_classes="primary-btn"
-                )
-            
-            # Status Display
-            gr.HTML('<div class="section-header">📊 System Status</div>')
-            with gr.Group(elem_classes="panel-container"):
-                status_box = gr.Textbox(
-                    label="",
-                    lines=10,
-                    interactive=False,
-                    elem_classes="status-display",
-                    value=get_system_info()
-                )
-                
-                gpu_stats = gr.Textbox(
-                    label="GPU Memory",
-                    interactive=False,
-                    elem_classes="stats-display",
-                    value=get_gpu_stats(ARGS_DEVICE)
-                )
-                
-                refresh_btn = gr.Button("🔄 Refresh Stats", size="sm")
-            
-            # Model Downloader Section
-            gr.HTML('<div class="section-header">📥 Model Downloader</div>')
-            with gr.Accordion("Download GGUF Models from HuggingFace", open=False):
-                with gr.Group(elem_classes="panel-container"):
-                    model_select = gr.Dropdown(
-                        choices=get_model_list(),
-                        label="Select Model",
-                        info="Popular pre-configured models"
-                    )
+    with gr.Tabs():
+        with gr.Tab("💬 Chat", id="chat"):
+            with gr.Row():
+                with gr.Column(scale=1):
+                    gr.HTML('<div class="section-title">⚡ Model Setup</div>')
                     
-                    gr.Markdown("**Or enter custom HuggingFace repo:**")
-                    with gr.Row():
-                        custom_repo = gr.Textbox(
-                            label="Repo ID",
-                            placeholder="username/repo-name",
-                            scale=2
+                    with gr.Group(elem_classes="card"):
+                        engine_radio = gr.Radio(
+                            ["Native (.pt)", "GGUF (.gguf)"],
+                            label="Engine Type",
+                            value="GGUF (.gguf)"
                         )
-                        custom_file = gr.Textbox(
-                            label="Filename",
-                            placeholder="model.gguf",
-                            scale=2
+                        
+                        model_path = gr.Textbox(
+                            label="Model Path",
+                            value="models/",
+                            placeholder="/path/to/model.gguf"
                         )
+                        
+                        with gr.Row():
+                            gpu_dropdown = gr.Dropdown(
+                                choices=[str(i) for i in range(max(1, torch.cuda.device_count()))],
+                                value=str(ARGS_DEVICE),
+                                label="GPU"
+                            )
+                            ctx_slider = gr.Slider(
+                                512, 8192, value=4096, step=256,
+                                label="Context Length"
+                            )
+                        
+                        load_btn = gr.Button("⚡ Load Model", variant="primary", elem_classes="btn-primary")
                     
-                    with gr.Row():
-                        download_btn = gr.Button("⬇️ Download Model", variant="primary")
-                        list_local_btn = gr.Button("📁 List Local", size="sm")
+                    gr.HTML('<div class="section-title">📊 Status</div>')
+                    with gr.Group(elem_classes="card"):
+                        status_box = gr.Textbox(label="", lines=6, interactive=False, elem_classes="status-box", value=get_system_info())
+                        gpu_stats = gr.Textbox(label="VRAM Usage", interactive=False, value=get_gpu_stats(ARGS_DEVICE))
+                        refresh_btn = gr.Button("🔄 Refresh", size="sm", elem_classes="btn-secondary")
+                
+                with gr.Column(scale=2):
+                    gr.HTML('<div class="section-title">🧠 Output</div>')
                     
-                    download_status = gr.Textbox(
-                        label="Download Status",
-                        lines=4,
-                        interactive=False,
-                        value=ui_list_local_models()
-                    )
+                    with gr.Group(elem_classes="card"):
+                        output_box = gr.Textbox(label="", lines=16, interactive=False, elem_classes="output-box", placeholder="Model response will appear here...")
                     
-                    downloaded_path = gr.Textbox(visible=False)  # Hidden field to store path
-                    
-                    use_model_btn = gr.Button("✅ Use This Model", visible=True, size="sm")
+                    gr.HTML('<div class="section-title">📝 Input</div>')
+                    with gr.Group(elem_classes="card"):
+                        input_box = gr.Textbox(label="", lines=3, placeholder="Type your message here... (Enter to send)")
+                        
+                        with gr.Row():
+                            with gr.Column(scale=1):
+                                temp_slider = gr.Slider(0.1, 2.0, value=0.7, step=0.05, label="Temperature")
+                            with gr.Column(scale=1):
+                                max_tokens_slider = gr.Slider(10, 4096, value=512, step=10, label="Max Tokens")
+                        
+                        with gr.Row():
+                            top_k_slider = gr.Slider(0, 500, value=40, step=5, label="Top-K")
+                            top_p_slider = gr.Slider(0.0, 1.0, value=0.95, step=0.01, label="Top-P")
+                            repeat_penalty_slider = gr.Slider(1.0, 2.0, value=1.1, step=0.05, label="Repeat Penalty")
+                        
+                        template_dropdown = gr.Dropdown(choices=list(CHAT_TEMPLATES.keys()), value="None (Raw)", label="💬 Chat Template")
+                        
+                        with gr.Row():
+                            generate_btn = gr.Button("🚀 Generate", variant="primary", elem_classes="btn-primary")
+                            stop_btn = gr.Button("⏹️ Stop", elem_classes="btn-danger")
+                            clear_btn = gr.Button("🗑️ Clear", elem_classes="btn-secondary")
         
-        # ═══════════════════════════════════════════════════════════════════════
-        # RIGHT PANEL - GENERATION
-        # ═══════════════════════════════════════════════════════════════════════
-        with gr.Column(scale=2):
-            gr.HTML('<div class="section-header">🧠 Neural Output</div>')
+        with gr.Tab("📥 Download Models", id="download"):
+            gr.HTML('<div class="section-title">Download GGUF Models from HuggingFace</div>')
             
-            with gr.Group(elem_classes="panel-container"):
-                output_box = gr.Textbox(
-                    label="",
-                    lines=18,
-                    interactive=False,
-                    elem_classes="output-display",
-                    placeholder="Awaiting neural transmission..."
-                )
+            with gr.Row():
+                with gr.Column(scale=2):
+                    with gr.Group(elem_classes="card"):
+                        model_select = gr.Dropdown(choices=get_model_list(), label="🎯 Select Model", info="Scroll to see all options")
+                        
+                        gr.HTML('<p style="color: var(--text-secondary); margin: 16px 0 8px;">Or enter custom repo:</p>')
+                        
+                        with gr.Row():
+                            custom_repo = gr.Textbox(label="Repo ID", placeholder="username/repo-name", scale=2)
+                            custom_file = gr.Textbox(label="Filename", placeholder="model-Q5_K_M.gguf", scale=2)
+                        
+                        with gr.Row():
+                            download_btn = gr.Button("⬇️ Download Model", variant="primary", elem_classes="btn-primary")
+                            list_local_btn = gr.Button("📁 Show Downloaded", elem_classes="btn-secondary")
+                
+                with gr.Column(scale=1):
+                    with gr.Group(elem_classes="card"):
+                        download_status = gr.Textbox(label="Status", lines=10, interactive=False, value=ui_list_local_models())
+                        downloaded_path = gr.Textbox(visible=False)
+                        use_model_btn = gr.Button("✅ Use This Model", elem_classes="btn-success")
+        
+        with gr.Tab("🏋️ Training", id="training"):
+            gr.HTML('<div class="section-title">Model Training Interface</div>')
             
-            gr.HTML('<div class="section-header">📝 Input Terminal</div>')
-            with gr.Group(elem_classes="panel-container"):
-                input_box = gr.Textbox(
-                    label="",
-                    lines=3,
-                    placeholder="Enter prompt for neural processing...",
-                )
+            with gr.Row():
+                with gr.Column(scale=1):
+                    with gr.Group(elem_classes="card"):
+                        gr.HTML('<div class="section-title">📂 Data Configuration</div>')
+                        train_dataset = gr.Textbox(label="Dataset Path", placeholder="data/train.jsonl", value="data/fineweb/")
+                        train_output = gr.Textbox(label="Output Path", placeholder="checkpoints/my_model", value="checkpoints/")
+                        
+                        with gr.Row():
+                            train_epochs = gr.Slider(1, 100, value=3, step=1, label="Epochs")
+                            train_batch = gr.Slider(1, 64, value=4, step=1, label="Batch Size")
+                        
+                        train_lr = gr.Slider(1e-6, 1e-3, value=3e-4, step=1e-6, label="Learning Rate")
+                        
+                        with gr.Row():
+                            train_start_btn = gr.Button("🚀 Start Training", variant="primary", elem_classes="btn-primary")
+                            train_stop_btn = gr.Button("⏹️ Stop", elem_classes="btn-danger")
                 
-                with gr.Row():
-                    with gr.Column(scale=1):
-                        temp_slider = gr.Slider(
-                            0.1, 2.0, value=0.8, step=0.05,
-                            label="Temperature"
-                        )
-                    with gr.Column(scale=1):
-                        max_tokens_slider = gr.Slider(
-                            10, 2000, value=256, step=10,
-                            label="Max Tokens"
-                        )
+                with gr.Column(scale=1):
+                    with gr.Group(elem_classes="card"):
+                        gr.HTML('<div class="section-title">📊 Training Status</div>')
+                        train_status = gr.Textbox(label="", lines=15, interactive=False, value="Ready to train.\n\nConfigure settings and click 'Start Training'.")
+        
+        with gr.Tab("⚙️ Settings", id="settings"):
+            gr.HTML('<div class="section-title">Application Settings</div>')
+            
+            with gr.Row():
+                with gr.Column(scale=1):
+                    with gr.Group(elem_classes="card"):
+                        gr.HTML('<div class="section-title">🎨 Appearance</div>')
+                        gr.HTML('<p style="color: var(--text-secondary);">Click the 🌙/☀️ button in the corner to toggle theme.</p>')
+                        
+                        gr.HTML('<div class="section-title">🔊 Voice Settings</div>')
+                        gr.HTML('''<p style="color: var(--text-secondary); margin-bottom: 12px;">
+                            ⚠️ <strong>Voice features require HTTPS</strong><br>
+                            Access via <code>https://</code> or <code>localhost</code> to enable microphone.<br>
+                            Current access via HTTP will block microphone access.
+                        </p>''')
+                        voice_enabled = gr.Checkbox(label="Enable Voice Features (requires HTTPS)", value=False)
+                        voice_speed = gr.Slider(0.5, 2.0, value=1.0, step=0.1, label="TTS Speed")
                 
-                with gr.Row():
-                    with gr.Column(scale=1):
-                        top_k_slider = gr.Slider(
-                            0, 500, value=50, step=5,
-                            label="Top-K (0=disabled)"
-                        )
-                    with gr.Column(scale=1):
-                        top_p_slider = gr.Slider(
-                            0.0, 1.0, value=0.95, step=0.01,
-                            label="Top-P (nucleus)"
-                        )
-                    with gr.Column(scale=1):
-                        repeat_penalty_slider = gr.Slider(
-                            1.0, 2.0, value=1.1, step=0.05,
-                            label="Repeat Penalty"
-                        )
-                
-                with gr.Row():
-                    template_dropdown = gr.Dropdown(
-                        choices=list(CHAT_TEMPLATES.keys()),
-                        value="None (Raw)",
-                        label="💬 Chat Template (auto-detected on load)",
-                        info="Wraps your prompt in the correct format"
-                    )
-                
-                with gr.Row():
-                    generate_btn = gr.Button(
-                        "🚀 TRANSMIT",
-                        elem_classes="primary-btn"
-                    )
-                    stop_btn = gr.Button(
-                        "⏹️ HALT",
-                        elem_classes="stop-btn"
-                    )
+                with gr.Column(scale=1):
+                    with gr.Group(elem_classes="card"):
+                        gr.HTML('<div class="section-title">🖥️ System Info</div>')
+                        system_info = gr.Textbox(label="", lines=10, interactive=False, value=get_system_info())
+                        gr.HTML(f"""<div style="color: var(--text-secondary); margin-top: 16px;">
+                            <p><strong>Version:</strong> SOVRA OMNI v3.0</p>
+                            <p><strong>PyTorch:</strong> {torch.__version__}</p>
+                            <p><strong>CUDA:</strong> {torch.cuda.is_available()}</p>
+                        </div>""")
     
-    # ═══════════════════════════════════════════════════════════════════════════
-    # EVENT HANDLERS
-    # ═══════════════════════════════════════════════════════════════════════════
-    load_btn.click(
-        ui_load,
-        inputs=[engine_radio, model_path, gpu_dropdown, ctx_slider],
-        outputs=[status_box, template_dropdown]  # Now also updates template dropdown
-    )
-    
-    refresh_btn.click(
-        ui_get_stats,
-        inputs=[gpu_dropdown],
-        outputs=gpu_stats
-    )
-    
-    # Generation with chat template support
-    generate_btn.click(
-        generate,
-        inputs=[input_box, max_tokens_slider, temp_slider, top_k_slider, top_p_slider, repeat_penalty_slider, template_dropdown, gpu_dropdown],
-        outputs=output_box
-    )
-    
-    input_box.submit(
-        generate,
-        inputs=[input_box, max_tokens_slider, temp_slider, top_k_slider, top_p_slider, repeat_penalty_slider, template_dropdown, gpu_dropdown],
-        outputs=output_box
-    )
-    
+    # Event Handlers
+    load_btn.click(ui_load, inputs=[engine_radio, model_path, gpu_dropdown, ctx_slider], outputs=[status_box, template_dropdown])
+    refresh_btn.click(ui_get_stats, inputs=[gpu_dropdown], outputs=gpu_stats)
+    generate_btn.click(generate, inputs=[input_box, max_tokens_slider, temp_slider, top_k_slider, top_p_slider, repeat_penalty_slider, template_dropdown, gpu_dropdown], outputs=output_box)
+    input_box.submit(generate, inputs=[input_box, max_tokens_slider, temp_slider, top_k_slider, top_p_slider, repeat_penalty_slider, template_dropdown, gpu_dropdown], outputs=output_box)
     stop_btn.click(stop_generation, outputs=status_box)
-    
-    # Download handlers
-    download_btn.click(
-        ui_download_model,
-        inputs=[model_select, custom_repo, custom_file],
-        outputs=[download_status, downloaded_path]
-    )
-    
-    list_local_btn.click(
-        ui_list_local_models,
-        outputs=download_status
-    )
-    
-    use_model_btn.click(
-        ui_use_downloaded,
-        inputs=[downloaded_path],
-        outputs=model_path
-    )
-    
-    # Note: demo.load() removed - use Refresh Stats button instead
-    # (Older Gradio versions don't support inputs in demo.load)
+    clear_btn.click(lambda: ("", ""), outputs=[input_box, output_box])
+    download_btn.click(ui_download_model, inputs=[model_select, custom_repo, custom_file], outputs=[download_status, downloaded_path])
+    list_local_btn.click(ui_list_local_models, outputs=download_status)
+    use_model_btn.click(ui_use_downloaded, inputs=[downloaded_path], outputs=model_path)
+    train_start_btn.click(start_training, inputs=[train_dataset, train_epochs, train_batch, train_lr, train_output], outputs=train_status)
+    train_stop_btn.click(stop_training, outputs=train_status)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # LAUNCH
@@ -1242,16 +1424,13 @@ with gr.Blocks(css=CSS, theme=cyberpunk_theme, title="SOVRA OMNI") as demo:
 if __name__ == "__main__":
     print(f"""
 ╔═══════════════════════════════════════════════════════════════════════════════╗
-║  SOVRA OMNI v2.1 - Initializing...                                            ║
+║  SOVRA OMNI v3.0 - Starting...                                                ║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
 ║  Port:   {args.port:<6}                                                       ║
 ║  Share:  {str(args.share):<6}                                                 ║
 ║  GPU:    {ARGS_DEVICE:<6}                                                     ║
+║  Models: {str(MODELS_DIR):<50}  ║
 ╚═══════════════════════════════════════════════════════════════════════════════╝
     """)
     
-    demo.queue().launch(
-        server_name="0.0.0.0",
-        server_port=args.port,
-        share=args.share
-    )
+    demo.queue().launch(server_name="0.0.0.0", server_port=args.port, share=args.share)
